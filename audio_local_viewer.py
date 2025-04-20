@@ -28,6 +28,7 @@ import shutil
 import os
 import requests
 import sys
+from scipy import signal
 
 # 添加中文字体支持
 is_windows = sys.platform.startswith('win')
@@ -113,7 +114,11 @@ class LocalViewer(Mini3DViewer):
         self.audio_thread = None
         self.audio_time = 0
         self.audio_frame_index = 0
+        self.current_sample = 0  # 当前音频样本索引，用于音频回调函数
         self.audio_frame_duration = 1.0 / self.cfg.fps if self.cfg.fps > 0 else 0.04  # default 25fps
+        
+        # 检测可用的音频设备
+        self.check_audio_devices()
         
         # 加载音频文件
         self.load_audio()
@@ -250,11 +255,21 @@ class LocalViewer(Mini3DViewer):
         if self.cfg.audio_path is not None and self.cfg.audio_path.exists():
             try:
                 print(f"Loading audio file: {self.cfg.audio_path}")
-                self.audio_data, self.sample_rate = sf.read(self.cfg.audio_path)
+                self.audio_data, original_sr = sf.read(self.cfg.audio_path)
+                
+                # 固定采样率为16000Hz
+                self.sample_rate = 16000
+                if original_sr != self.sample_rate:
+                    print(f"重采样音频从 {original_sr}Hz 到 {self.sample_rate}Hz")
+                    num_samples = int(len(self.audio_data) * self.sample_rate / original_sr)
+                    self.audio_data = signal.resample(self.audio_data, num_samples)
+                
                 # 如果是单声道，转换为立体声
                 if len(self.audio_data.shape) == 1:
                     self.audio_data = np.stack([self.audio_data, self.audio_data], axis=1)
+                
                 print(f"Audio loaded: {self.audio_data.shape}, sr={self.sample_rate}Hz")
+                self.current_sample = 0
             except Exception as e:
                 print(f"Error loading audio file: {e}")
                 self.audio_data = None
@@ -263,106 +278,228 @@ class LocalViewer(Mini3DViewer):
             print("No audio file specified or file does not exist.")
             
     def audio_callback(self, outdata, frames, time, status):
-        """音频播放回调函数"""
+        """音频回调函数，用于提供音频数据流"""
         if status:
-            print(f"Audio status: {status}")
-        
-        if self.audio_data is None or not self.audio_playing:
+            print(f"音频回调状态: {status}")
+            
+        # 如果用户停止了播放或者应用关闭，返回静音数据
+        if not self.audio_playing or not dpg.is_dearpygui_running():
             outdata.fill(0)
             return
             
-        # 获取当前记录时间线位置
         try:
-            current_record_timestep = dpg.get_value("_slider_record_timestep")
-            if current_record_timestep != self.audio_frame_index:
-                # 视觉帧和音频帧不同步，重新同步
-                self.audio_frame_index = current_record_timestep
-        except:
-            pass
+            # 计算当前音频帧对应的音频样本索引
+            current_frame = dpg.get_value("_slider_record_timestep")
+            sample_index = int(current_frame * self.audio_frame_duration * self.sample_rate)
             
-        # 计算当前帧位置
-        current_sample = int(self.audio_frame_index * self.audio_frame_duration * self.sample_rate)
-        
-        # 应用音频偏移
-        current_sample += int(self.cfg.audio_offset * self.sample_rate)
-        
-        # 如果偏移使得起始位置为负，填充0
-        if current_sample < 0:
-            zero_frames = min(frames, abs(current_sample))
-            audio_frames = frames - zero_frames
-            outdata[:zero_frames].fill(0)
+            # 更新当前样本索引（如果需要同步）
+            self.current_sample = sample_index
             
-            if audio_frames > 0 and abs(current_sample) < len(self.audio_data):
-                outdata[zero_frames:] = self.audio_data[:audio_frames]
+            # 计算结束索引
+            end_idx = sample_index + frames
+            
+            # 检查是否已经播放到文件末尾
+            if end_idx >= len(self.audio_data):
+                # 填充剩余的部分
+                remaining = len(self.audio_data) - sample_index
+                if remaining > 0:
+                    outdata[:remaining] = self.audio_data[sample_index:len(self.audio_data)]
+                    outdata[remaining:] = 0
+                else:
+                    outdata.fill(0)
+                
+                # 判断是否循环播放
+                if dpg.get_value("_checkbox_loop_record"):
+                    # 将视觉时间轴重置到开始
+                    dpg.set_value("_slider_record_timestep", 0)
+                    print("音频播放结束，循环重新开始")
+                    return  # 退出此次回调，下一次回调会从重置的位置开始
+                else:
+                    # 停止播放
+                    self.audio_playing = False
+                    print("音频播放完成")
+                    return
             else:
-                outdata[zero_frames:].fill(0)
-                
-            current_sample = audio_frames
-        else:
-            end_sample = current_sample + frames
-            
-            # 检查是否播放到文件末尾
-            if current_sample >= len(self.audio_data):
-                outdata.fill(0)
-                # 不要自动停止音频，让视觉控制循环
-                return
-                
-            # 计算需要多少音频帧
-            if end_sample > len(self.audio_data):
-                # 如果请求的帧超出了音频长度，填充剩余部分为0
-                audio_part = self.audio_data[current_sample:len(self.audio_data)]
-                zeros_part = np.zeros((frames - len(audio_part), self.audio_data.shape[1]), dtype=self.audio_data.dtype)
-                outdata[:len(audio_part)] = audio_part
-                outdata[len(audio_part):] = zeros_part
-            else:
-                # 正常情况
-                outdata[:] = self.audio_data[current_sample:end_sample]
-                
-        # 更新音频帧索引
-        self.audio_frame_index += frames / (self.audio_frame_duration * self.sample_rate)
+                # 正常播放
+                outdata[:] = self.audio_data[sample_index:end_idx]
+        except Exception as e:
+            print(f"音频回调异常: {e}")
+            import traceback
+            traceback.print_exc()
+            outdata.fill(0)  # 发生错误时输出静音
     
     def start_audio(self):
         """开始播放音频"""
-        if self.audio_data is None or self.audio_playing:
+        if self.audio_data is None:
+            print("无法播放音频：未加载音频数据")
+            return
+            
+        if self.audio_playing:
+            print("音频已经在播放中")
             return
             
         def audio_player():
             try:
+                print("开始音频播放线程")
+                
                 # 从当前视觉帧的对应位置开始播放音频
                 self.audio_frame_index = dpg.get_value("_slider_record_timestep")
                 
                 # 计算开始时间(秒)
                 start_time = self.audio_frame_index * self.audio_frame_duration
+                print(f"音频开始位置: 帧 {self.audio_frame_index}, 时间 {start_time:.2f}秒")
+                
+                # 初始化当前音频样本索引
+                self.current_sample = int(start_time * self.sample_rate)
+                print(f"初始化音频样本索引: {self.current_sample}")
                 
                 # 使用 blocksize 参数控制音频缓冲区大小，可以提高同步精度
                 # 设置一个相对较小的缓冲区大小，以减少延迟
                 blocksize = 1024  # 可以根据需要调整
                 
-                # 创建音频流
-                with sd.OutputStream(
-                    samplerate=self.sample_rate,
-                    channels=self.audio_data.shape[1],
-                    callback=self.audio_callback,
-                    blocksize=blocksize
-                ) as stream:
-                    self.audio_stream = stream
-                    self.audio_playing = True
-                    
-                    # 等待直到音频播放停止
-                    while self.audio_playing and dpg.is_dearpygui_running():
-                        sd.sleep(100)
+                # 获取系统默认设备信息
+                try:
+                    default_device = sd.default.device
+                    print(f"系统默认音频设备: 输入 {default_device[0]}, 输出 {default_device[1]}")
+                except Exception as e:
+                    print(f"获取默认音频设备失败: {e}")
+                    default_device = (None, None)
+                
+                # 列出可用音频设备以供诊断
+                available_outputs = []
+                try:
+                    devices = sd.query_devices()
+                    print(f"系统可用音频设备列表:")
+                    for i, dev in enumerate(devices):
+                        is_output = dev['max_output_channels'] > 0
+                        print(f"  设备 {i}: {dev['name']} ({'输出' if is_output else '输入'})")
+                        if is_output:
+                            available_outputs.append(i)
+                    print(f"找到 {len(available_outputs)} 个可用的输出设备: {available_outputs}")
+                except Exception as e:
+                    print(f"获取音频设备列表失败: {e}")
+                    devices = []
+                
+                # 检查是否需要使用虚拟音频设备
+                if not available_outputs:
+                    print("警告: 没有找到可用的音频输出设备。尝试使用虚拟设备...")
+                    try:
+                        # 使用numpy虚拟音频设备
+                        print("创建虚拟音频流 (仅用于测试，不会有实际声音输出)")
+                        temp_buffer = np.zeros((1000, self.audio_data.shape[1]), dtype=self.audio_data.dtype)
+                        self.audio_stream = None  # 不使用实际流
+                        self.audio_playing = True
                         
+                        # 模拟音频播放线程
+                        while self.audio_playing and dpg.is_dearpygui_running():
+                            # 更新时间线位置
+                            current_step = dpg.get_value("_slider_record_timestep")
+                            next_step = min(current_step + 1, self.num_record_timeline - 1)
+                            if next_step == self.num_record_timeline - 1 and dpg.get_value("_checkbox_loop_record"):
+                                next_step = 0
+                            
+                            # 更新位置
+                            if current_step != next_step:
+                                dpg.set_value("_slider_record_timestep", next_step)
+                                self.current_sample = int(next_step * self.audio_frame_duration * self.sample_rate)
+                            
+                            # 模拟适当的播放速度
+                            sd.sleep(int(1000 / self.cfg.fps))
+                        
+                        return  # 直接返回，不执行下面的音频设备尝试
+                    except Exception as e:
+                        print(f"创建虚拟音频流失败: {e}")
+                        self.audio_playing = False
+                
+                # 创建音频流，尝试使用找到的第一个输出设备
+                device_to_use = None
+                if available_outputs:
+                    device_to_use = available_outputs[0]
+                    print(f"将使用设备 {device_to_use} 作为音频输出设备")
+                else:
+                    print("未找到可用的音频设备，将尝试使用系统默认...")
+                
+                # 尝试创建音频流
+                try:
+                    print(f"创建音频输出流，使用设备: {device_to_use}")
+                    with sd.OutputStream(
+                        samplerate=self.sample_rate,
+                        channels=self.audio_data.shape[1],
+                        callback=self.audio_callback,
+                        blocksize=1024,
+                        device=device_to_use
+                    ) as stream:
+                        print(f"音频流创建成功，开始播放，采样率: {self.sample_rate}Hz, 通道数: {self.audio_data.shape[1]}")
+                        self.audio_stream = stream
+                        self.audio_playing = True
+                        
+                        # 等待直到音频播放停止
+                        while self.audio_playing and dpg.is_dearpygui_running():
+                            sd.sleep(100)
+                except Exception as e:
+                    print(f"创建音频流失败: {e}")
+                    # 尝试使用PulseAudio的默认设备名称
+                    try:
+                        print("尝试使用PulseAudio的默认设备...")
+                        pulse_device = "default"
+                        with sd.OutputStream(
+                            samplerate=self.sample_rate,
+                            channels=self.audio_data.shape[1],
+                            callback=self.audio_callback,
+                            blocksize=1024,
+                            device=pulse_device
+                        ) as stream:
+                            print(f"使用PulseAudio设备成功创建音频流")
+                            self.audio_stream = stream
+                            self.audio_playing = True
+                            
+                            # 等待直到音频播放停止
+                            while self.audio_playing and dpg.is_dearpygui_running():
+                                sd.sleep(100)
+                    except Exception as e2:
+                        print(f"使用PulseAudio设备尝试失败: {e2}")
+                        try:
+                            print("尝试使用虚拟音频输出...")
+                            # 如果所有输出设备尝试失败，回落到虚拟模式
+                            temp_buffer = np.zeros((1000, self.audio_data.shape[1]), dtype=self.audio_data.dtype)
+                            self.audio_stream = None  # 不使用实际流
+                            self.audio_playing = True
+                            
+                            # 模拟音频播放线程
+                            while self.audio_playing and dpg.is_dearpygui_running():
+                                # 更新时间线位置
+                                current_step = dpg.get_value("_slider_record_timestep")
+                                next_step = min(current_step + 1, self.num_record_timeline - 1)
+                                if next_step == self.num_record_timeline - 1 and dpg.get_value("_checkbox_loop_record"):
+                                    next_step = 0
+                                
+                                # 更新位置
+                                if current_step != next_step:
+                                    dpg.set_value("_slider_record_timestep", next_step)
+                                    self.current_sample = int(next_step * self.audio_frame_duration * self.sample_rate)
+                                
+                                # 模拟适当的播放速度
+                                sd.sleep(int(1000 / self.cfg.fps))
+                        except Exception as e3:
+                            print(f"所有音频输出方法失败: {e3}")
+                            import traceback
+                            traceback.print_exc()
             except Exception as e:
-                print(f"Audio playback error: {e}")
+                print(f"音频播放失败: {e}")
+                import traceback
+                traceback.print_exc()
             finally:
+                print("音频播放线程结束")
                 self.audio_playing = False
                 self.audio_stream = None
         
         # 终止任何现有的音频线程
         if self.audio_thread is not None and self.audio_thread.is_alive():
+            print("停止现有音频线程")
             self.stop_audio()
             time.sleep(0.1)  # 等待线程完全终止
         
+        print("启动新的音频播放线程")
         self.audio_thread = threading.Thread(target=audio_player)
         self.audio_thread.daemon = True
         self.audio_thread.start()
@@ -1019,12 +1156,12 @@ class LocalViewer(Mini3DViewer):
                 
         # window: audio controls ==================================================================================================
         if self.audio_data is not None:
-            with dpg.window(label="音频控制", tag="_audio_window", autosize=True, pos=(self.W-300, self.H//2)):
+            with dpg.window(label="Audio Controls", tag="_audio_window", autosize=True, pos=(self.W-300, self.H//2)):
                 # 显示音频信息
                 audio_duration = len(self.audio_data) / self.sample_rate
-                dpg.add_text(f"音频文件: {self.cfg.audio_path.name}")
-                dpg.add_text(f"时长: {audio_duration:.2f}秒")
-                dpg.add_text(f"采样率: {self.sample_rate}Hz")
+                dpg.add_text(f"Audio file: {self.cfg.audio_path.name}")
+                dpg.add_text(f"Duration: {audio_duration:.2f}s")
+                dpg.add_text(f"Sample rate: {self.sample_rate}Hz")
                 
                 # 自动模式
                 def callback_auto_mode(sender, app_data):
@@ -1038,8 +1175,14 @@ class LocalViewer(Mini3DViewer):
                         # 显示所有Record窗口控件
                         dpg.configure_item("_keyframes_group", show=True)
                         dpg.configure_item("_keyframe_edit_group", show=True)
-                dpg.add_checkbox(label="自动模式 (简化界面)", default_value=self.auto_mode, 
+                dpg.add_checkbox(label="Auto mode (simplified interface)", default_value=self.auto_mode, 
                                 callback=callback_auto_mode, tag="_checkbox_auto_mode")
+                
+                # 锁定摄像机选项
+                def callback_lock_camera(sender, app_data):
+                    pass  # 仅需要记录状态，不需要额外操作
+                dpg.add_checkbox(label="Lock camera during playback", default_value=False, 
+                                callback=callback_lock_camera, tag="_checkbox_lock_camera")
                 
                 # 重置关键帧按钮
                 def callback_reset_keyframes(sender, app_data):
@@ -1087,7 +1230,7 @@ class LocalViewer(Mini3DViewer):
                     # 提示用户
                     print("关键帧已重置，已自动设置第一帧和最后一帧作为关键帧")
                 
-                dpg.add_button(label="重置关键帧", tag="_button_reset_keyframes", callback=callback_reset_keyframes)
+                dpg.add_button(label="Reset Keyframes", tag="_button_reset_keyframes", callback=callback_reset_keyframes)
                 
                 # 音频偏移设置
                 def callback_set_audio_offset(sender, app_data):
@@ -1096,17 +1239,20 @@ class LocalViewer(Mini3DViewer):
                     if self.audio_playing:
                         self.stop_audio()
                         self.start_audio()
-                dpg.add_slider_float(label="音频偏移 (秒)", min_value=-5.0, max_value=5.0, format="%.2f", 
+                dpg.add_slider_float(label="Audio offset (seconds)", min_value=-5.0, max_value=5.0, format="%.2f", 
                                     default_value=self.cfg.audio_offset, callback=callback_set_audio_offset, width=200)
                 
                 # 锁定帧率
                 def callback_lock_frame_rate(sender, app_data):
                     self.cfg.lock_frame_rate = app_data
-                dpg.add_checkbox(label="锁定帧率", default_value=self.cfg.lock_frame_rate, 
+                dpg.add_checkbox(label="Lock frame rate", default_value=self.cfg.lock_frame_rate, 
                                 callback=callback_lock_frame_rate, tag="_checkbox_lock_frame_rate")
                 
                 # 音频位置
-                dpg.add_text("音频位置: 0.00秒", tag="_text_audio_position")
+                dpg.add_text("Audio position: 0.00s", tag="_text_audio_position")
+                
+                # 添加帧数显示
+                dpg.add_text(f"Frame: 0 / {self.num_timesteps}", tag="_text_frame_position")
                 
                 # 音频播放进度条
                 def callback_set_audio_position(sender, app_data):
@@ -1124,9 +1270,9 @@ class LocalViewer(Mini3DViewer):
                     if self.audio_playing:
                         self.audio_frame_index = frame_position
                 
-                dpg.add_slider_float(label="播放进度", width=200, tag="_slider_audio_position",
+                dpg.add_slider_float(label="Playback progress", width=200, tag="_slider_audio_position",
                                      min_value=0.0, max_value=audio_duration, 
-                                     format="%.2f秒", default_value=0.0, 
+                                     format="%.2fs", default_value=0.0, 
                                      callback=callback_set_audio_position)
                 
                 # 控制按钮
@@ -1137,12 +1283,12 @@ class LocalViewer(Mini3DViewer):
                             # 同时开始渲染动画
                             self.playing = True
                             self.need_update = True
-                    dpg.add_button(label="播放", tag="_button_audio_play", callback=callback_audio_play)
+                    dpg.add_button(label="Play", tag="_button_audio_play", callback=callback_audio_play)
                     
                     def callback_audio_stop(sender, app_data):
                         self.stop_audio()
                         self.playing = False
-                    dpg.add_button(label="停止", tag="_button_audio_stop", callback=callback_audio_stop)
+                    dpg.add_button(label="Stop", tag="_button_audio_stop", callback=callback_audio_stop)
                     
                     def callback_audio_restart(sender, app_data):
                         self.stop_audio()
@@ -1152,7 +1298,7 @@ class LocalViewer(Mini3DViewer):
                         state_dict = self.get_state_dict_record()
                         self.apply_state_dict(state_dict)
                         self.need_update = True
-                    dpg.add_button(label="重新开始", tag="_button_audio_restart", callback=callback_audio_restart)
+                    dpg.add_button(label="Restart", tag="_button_audio_restart", callback=callback_audio_restart)
                 
                 # 添加自动播放按钮
                 def callback_auto_play(sender, app_data):
@@ -1216,8 +1362,8 @@ class LocalViewer(Mini3DViewer):
                         import traceback
                         traceback.print_exc()
                 
-                dpg.add_button(label="自动播放", tag="_button_auto_play", callback=callback_auto_play)
-        
+                dpg.add_button(label="Auto Play", tag="_button_auto_play", callback=callback_auto_play)
+
         # window: recording ==================================================================================================
         with dpg.window(label="Record", tag="_record_window", autosize=True, pos=(0, self.H//2)):
             dpg.add_text("Keyframes")
@@ -1292,7 +1438,7 @@ class LocalViewer(Mini3DViewer):
                 self.apply_state_dict(state_dict)
                 self.need_update = True
                 
-                # 更新音频帧索引，使音频与视觉同步
+                # Update audio frame index to keep audio and visual in sync
                 if self.audio_playing:
                     self.audio_frame_index = app_data
             dpg.add_slider_int(label="timeline", tag='_slider_record_timestep', width=200, min_value=0, max_value=0, format="%d", default_value=0, callback=callback_set_record_timestep)
@@ -1303,25 +1449,25 @@ class LocalViewer(Mini3DViewer):
             
             with dpg.group(horizontal=True):
                 def callback_play(sender, app_data):
-                    # 如果没有关键帧，自动创建关键帧
+                    # If no keyframes, automatically create keyframes
                     if len(self.keyframes) == 0:
                         try:
-                            # 直接调用auto_play功能
+                            # Directly call auto_play feature
                             callback_auto_play(None, None)
                             return
                         except Exception as e:
-                            print(f"自动创建关键帧失败: {e}")
+                            print(f"Failed to automatically create keyframes: {e}")
                             return
                             
-                    # 如果时间线为空，无法播放
+                    # If timeline is empty, cannot play
                     if self.num_record_timeline <= 0:
-                        print("警告: 无法播放，请先添加有效的关键帧")
+                        print("Warning: Cannot play, please add valid keyframes")
                         return
                         
                     self.playing = not self.playing
                     self.need_update = True
                     
-                    # 同步音频播放状态
+                    # Sync audio playback status
                     if self.playing and self.audio_data is not None and not self.audio_playing:
                         self.start_audio()
                     elif not self.playing and self.audio_playing:
@@ -1406,21 +1552,21 @@ class LocalViewer(Mini3DViewer):
                 
                 dpg.add_separator()
                 
-                # 添加API获取FLAME参数的功能
-                dpg.add_text("从API获取FLAME参数")
+                # Add API feature to get FLAME parameters
+                dpg.add_text("Get FLAME parameters from API")
                 
                 with dpg.group(horizontal=True):
-                    dpg.add_input_text(label="角色ID", default_value="M003", tag="_input_subject_style", width=100)
+                    dpg.add_input_text(label="Character ID", default_value="M003", tag="_input_subject_style", width=100)
                     dpg.add_combo(
                         ["neutral", "happy", "sad", "surprise", "fear", "disgust", "anger", "contempt"], 
-                        label="情绪类型", 
+                        label="Emotion type", 
                         default_value="neutral", 
                         tag="_combo_emotion", 
                         width=100
                     )
                 
                 with dpg.group(horizontal=True):
-                    dpg.add_slider_int(label="情绪强度", min_value=0, max_value=2, default_value=2, tag="_slider_intensity", width=100)
+                    dpg.add_slider_int(label="Emotion intensity", min_value=0, max_value=2, default_value=2, tag="_slider_intensity", width=100)
                     
                     def callback_get_flame_from_api(sender, app_data):
                         subject_style = dpg.get_value("_input_subject_style")
@@ -1428,7 +1574,7 @@ class LocalViewer(Mini3DViewer):
                         intensity = dpg.get_value("_slider_intensity")
                         
                         if self.cfg.audio_path is None:
-                            print("请先设置音频文件路径")
+                            print("Please set the audio file path first")
                             return
                         
                         success = self.get_flame_params_from_api(
@@ -1439,24 +1585,24 @@ class LocalViewer(Mini3DViewer):
                         )
                         
                         if success:
-                            # 使控制生效
+                            # Enable control
                             dpg.set_value("_checkbox_enable_control", True)
-                            # 更新UI
+                            # Update UI
                             self.need_update = True
                             
-                            # 重置到起点
+                            # Reset to start
                             dpg.set_value("_slider_record_timestep", 0)
                             if hasattr(self, 'audio_frame_index'):
                                 self.audio_frame_index = 0
                                 
-                            # 停止当前播放（如果有）
+                            # Stop current playback if any
                             if self.audio_playing:
                                 self.stop_audio()
                                 
-                            # 启动音频播放
+                            # Start audio playback
                             self.start_audio()
                             
-                            # 自动开始渲染动画
+                            # Auto start rendering animation
                             self.playing = True
 
         # widget-dependent handlers ========================================================================================
@@ -1487,59 +1633,88 @@ class LocalViewer(Mini3DViewer):
             camera_center = torch.tensor(self.cam.pose[:3, 3]).cuda()
         return Cam
 
+    def update_audio_display(self):
+        """更新界面上的音频位置显示"""
+        if not self.audio_playing or self.audio_data is None:
+            return
+            
+        # 获取当前播放帧位置
+        current_frame = dpg.get_value("_slider_record_timestep")
+        audio_position = current_frame * self.audio_frame_duration
+        
+        # 更新音频位置显示
+        if dpg.does_item_exist("_text_audio_position"):
+            dpg.set_value("_text_audio_position", f"Audio position: {audio_position:.2f}s")
+            
+        # 更新帧数显示
+        if dpg.does_item_exist("_text_frame_position"):
+            # 如果是dynamic模式，使用timestep作为当前帧
+            if dpg.get_value("_checkbox_dynamic_record"):
+                current_npz_frame = self.timestep
+            else:
+                # 非dynamic模式，根据时间线进度估算NPZ帧数
+                if self.num_record_timeline > 1:
+                    # 计算播放进度比例
+                    progress = current_frame / (self.num_record_timeline - 1)
+                    # 根据进度比例计算当前NPZ帧
+                    current_npz_frame = int(progress * (self.num_timesteps - 1))
+                else:
+                    current_npz_frame = 0
+                    
+            dpg.set_value("_text_frame_position", f"Frame: {current_npz_frame} / {self.num_timesteps-1}")
+            
+        # 更新进度条，但不触发回调
+        if dpg.does_item_exist("_slider_audio_position"):
+            # 暂时移除回调函数
+            callback = dpg.get_item_callback("_slider_audio_position")
+            dpg.set_item_callback("_slider_audio_position", None)
+            
+            # 更新值
+            dpg.set_value("_slider_audio_position", audio_position)
+            
+            # 恢复回调函数
+            dpg.set_item_callback("_slider_audio_position", callback)
+            
     @torch.no_grad()
     def run(self):
         print("Running LocalViewer...")
-        print(f"配置信息:")
-        print(f"- 点云路径: {self.cfg.point_path}")
-        print(f"- 动作路径: {self.cfg.motion_path}")
-        print(f"- 音频路径: {self.cfg.audio_path}")
+        print(f"Configuration:")
+        print(f"- Point cloud path: {self.cfg.point_path}")
+        print(f"- Motion path: {self.cfg.motion_path}")
+        print(f"- Audio path: {self.cfg.audio_path}")
         print(f"- API URL: {self.cfg.api_url}")
-        print(f"- 帧率: {self.cfg.fps}")
-        print(f"- 音频偏移: {self.cfg.audio_offset}")
-        print(f"- 自动模式: {self.auto_mode}")
+        print(f"- FPS: {self.cfg.fps}")
+        print(f"- Audio offset: {self.cfg.audio_offset}")
+        print(f"- Auto mode: {self.auto_mode}")
         
         if self.gaussians.binding is not None:
-            print(f"FLAME模型已加载:")
-            print(f"- 总时间步数: {self.num_timesteps}")
-            print(f"- FLAME参数:")
+            print(f"FLAME model loaded:")
+            print(f"- Total timesteps: {self.num_timesteps}")
+            print(f"- FLAME parameters:")
             for k, v in self.gaussians.flame_param.items():
                 print(f"  - {k}: {v.shape}")
         else:
-            print("未加载FLAME模型")
+            print("FLAME model not loaded")
         
-        # 帧率控制变量
+        # Frame rate control variables
         last_frame_time = time.time()
-        target_frame_time = 1.0 / self.cfg.fps if self.cfg.fps > 0 else 0.04  # 默认25fps
+        target_frame_time = 1.0 / self.cfg.fps if self.cfg.fps > 0 else 0.04  # default 25fps
 
         while dpg.is_dearpygui_running():
             current_time = time.time()
             
             # 更新音频位置显示
-            if self.audio_playing and hasattr(self, 'audio_frame_index') and self.audio_data is not None:
-                audio_position = self.audio_frame_index * self.audio_frame_duration
-                # 更新文本显示
-                if dpg.does_item_exist("_text_audio_position"):
-                    dpg.set_value("_text_audio_position", f"音频位置: {audio_position:.2f}秒")
-                # 更新进度条，但不触发回调以避免循环
-                if dpg.does_item_exist("_slider_audio_position"):
-                    # 临时移除回调
-                    callback = dpg.get_item_callback("_slider_audio_position")
-                    dpg.set_item_callback("_slider_audio_position", None)
-                    # 更新值
-                    dpg.set_value("_slider_audio_position", audio_position)
-                    # 恢复回调
-                    dpg.set_item_callback("_slider_audio_position", callback)
-
+            self.update_audio_display()
+            
             if self.need_update or self.playing:
-                # 帧率锁定 - 重要：这确保音频和视觉同步
+                # Frame rate lock - Important: This ensures audio and visual sync
                 if self.playing and self.cfg.lock_frame_rate:
                     elapsed = current_time - last_frame_time
                     if elapsed < target_frame_time:
                         time.sleep(target_frame_time - elapsed)
                         current_time = time.time()
                 
-                # 渲染当前帧
+                # Render current frame
                 cam = self.prepare_camera()
 
                 if dpg.get_value("_checkbox_show_splatting"):
@@ -1576,7 +1751,7 @@ class LocalViewer(Mini3DViewer):
                     record_timestep = dpg.get_value("_slider_record_timestep")
                     next_timestep = record_timestep + 1
                     
-                    # 检查是否到达末尾
+                    # Check if reached the end
                     if next_timestep >= self.num_record_timeline - 1:
                         if not dpg.get_value("_checkbox_loop_record"):
                             self.playing = False
@@ -1584,57 +1759,164 @@ class LocalViewer(Mini3DViewer):
                                 self.stop_audio()
                         next_timestep = 0
                     
-                    # 更新时间线
+                    # Update timeline
                     dpg.set_value("_slider_record_timestep", next_timestep)
                     
-                    # 更新音频帧索引 - 重要：这让音频和视觉保持同步
+                    # Update audio frame index - Important: This keeps audio and visual in sync
                     if self.audio_playing:
                         self.audio_frame_index = next_timestep
                     
-                    # 更新动态时间步
+                    # Update dynamic timestep
                     if dpg.get_value("_checkbox_dynamic_record"):
                         self.timestep = min(self.timestep + 1, self.num_timesteps - 1)
                         dpg.set_value("_slider_timestep", self.timestep)
                         self.gaussians.select_mesh_by_timestep(self.timestep)
 
-                    # 应用状态
-                    state_dict = self.get_state_dict_record()
-                    self.apply_state_dict(state_dict)
+                    # 只有在锁定摄像机时才应用关键帧中的摄像机状态
+                    if dpg.does_item_exist("_checkbox_lock_camera") and dpg.get_value("_checkbox_lock_camera"):
+                        state_dict = self.get_state_dict_record()
+                        self.apply_state_dict(state_dict)
 
             dpg.render_dearpygui_frame()
 
+    def check_audio_devices(self):
+        """检测系统中可用的音频设备并输出诊断信息"""
+        print("===== 音频设备诊断 =====")
+        
+        # 检查sounddevice库的版本
+        print(f"sounddevice 版本: {sd.__version__}")
+        
+        # 检查系统信息
+        import platform
+        print(f"操作系统: {platform.system()} {platform.release()}")
+        
+        # 检查默认设备
+        try:
+            default_device = sd.default.device
+            print(f"系统默认音频设备: 输入={default_device[0]}, 输出={default_device[1]}")
+            if default_device[1] == -1:
+                print("警告: 系统默认输出设备为-1，这可能会导致问题")
+        except Exception as e:
+            print(f"获取默认音频设备失败: {e}")
+        
+        # 检查音频输出设备
+        available_outputs = []
+        try:
+            devices = sd.query_devices()
+            print(f"系统中发现 {len(devices)} 个音频设备:")
+            
+            for i, dev in enumerate(devices):
+                is_output = dev['max_output_channels'] > 0
+                device_type = '输出' if is_output else '输入'
+                if is_output:
+                    available_outputs.append(i)
+                
+                # 打印详细设备信息
+                print(f"  设备 {i}: {dev['name']} ({device_type})")
+                print(f"    通道: 输入={dev['max_input_channels']}, 输出={dev['max_output_channels']}")
+                print(f"    默认采样率: {dev['default_samplerate']}Hz")
+                print(f"    格式: {dev.get('formats', '未知')}")
+                
+            if available_outputs:
+                print(f"找到 {len(available_outputs)} 个输出设备: {available_outputs}")
+            else:
+                print("警告: 未找到任何音频输出设备！")
+                
+            # 如果默认设备无效，但找到了其他输出设备，建议使用第一个
+            if default_device[1] == -1 and available_outputs:
+                print(f"建议: 由于默认输出设备无效，可以使用设备ID {available_outputs[0]} 作为替代")
+                
+        except Exception as e:
+            print(f"查询音频设备失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+        print("========================")
+
 
 if __name__ == "__main__":
+    # 尝试初始化声卡系统
+    print("正在初始化音频系统...")
+    
+    # 检查并尝试修复默认设备
+    try:
+        default_device = sd.default.device
+        print(f"当前默认音频设备: 输入={default_device[0]}, 输出={default_device[1]}")
+        
+        # 如果默认输出设备无效，尝试设置为0
+        if default_device[1] == -1:
+            print("默认输出设备无效，尝试设置为设备0...")
+            try:
+                sd.default.device = (default_device[0], 0)
+                print(f"已将默认输出设备设置为0")
+            except Exception as e:
+                print(f"设置默认输出设备失败: {e}")
+    except Exception as e:
+        print(f"检查默认音频设备失败: {e}")
+    
+    # 尝试列出可用设备
+    try:
+        devices = sd.query_devices()
+        outputs = []
+        for i, dev in enumerate(devices):
+            if dev['max_output_channels'] > 0:
+                outputs.append(i)
+        
+        if outputs:
+            print(f"找到 {len(outputs)} 个输出设备")
+            try:
+                default_device = sd.default.device
+                if default_device[1] == -1 or default_device[1] not in outputs:
+                    best_device = outputs[0]
+                    print(f"自动选择输出设备 {best_device}")
+                    try:
+                        sd.default.device = (default_device[0], best_device)
+                        print(f"已设置默认输出设备为 {best_device}")
+                    except Exception as e:
+                        print(f"设置默认设备失败: {e}")
+            except Exception as e:
+                print(f"检查默认设备状态失败: {e}")
+        else:
+            print("未找到有效的输出设备，将启用虚拟音频模式")
+    except Exception as e:
+        print(f"列出音频设备失败: {e}")
+    
+    # 最终检查配置
+    try:
+        print(f"音频系统初始化完成，当前默认设备: {sd.default.device}")
+    except Exception as e:
+        print(f"获取默认设备信息失败: {e}")
+    
     cfg = tyro.cli(Config)
     
-    # 如果设置了test_api，先测试API是否可用
+    # If test_api is set, test API connection first
     if cfg.test_api:
-        print("测试API连接...")
+        print("Testing API connection...")
         try:
             api_url = cfg.api_url
             health_check = requests.get(f"{api_url}/health", timeout=2)
             if health_check.status_code == 200:
-                print(f"API服务正常: {health_check.text}")
+                print(f"API service is normal: {health_check.text}")
                 
-                # 尝试直接用API生成FLAME参数
+                # Try to directly generate FLAME parameters using API
                 audio_path = None
                 
-                # 优先使用server_audio_path参数
+                # Prioritize using server_audio_path parameter
                 if cfg.server_audio_path:
                     audio_path = cfg.server_audio_path
-                    print(f"使用服务器上的音频路径: {audio_path}")
-                # 否则尝试使用audio_path参数
+                    print(f"Using audio path on server: {audio_path}")
+                # Otherwise, try using audio_path parameter
                 elif cfg.audio_path:
                     audio_path = str(cfg.audio_path)
                     if not os.path.isabs(audio_path):
                         abs_audio_path = os.path.abspath(audio_path)
-                        print(f"将本地路径转换为绝对路径: {abs_audio_path}")
+                        print(f"Converting local path to absolute path: {abs_audio_path}")
                         audio_path = abs_audio_path
-                    print(f"使用本地音频路径: {audio_path}")
-                    print("警告: 服务器可能无法访问此本地路径，请考虑使用--server_audio_path参数")
+                    print(f"Using local audio path: {audio_path}")
+                    print("Warning: Server may not be able to access this local path, consider using --server_audio_path parameter")
                 
                 if audio_path:
-                    # 构建请求
+                    # Construct request
                     flame_api_url = f"{api_url}/api/flame_from_path"
                     payload = {
                         "audio_path": audio_path,
@@ -1643,38 +1925,38 @@ if __name__ == "__main__":
                         "intensity": 2
                     }
                     
-                    print(f"发送请求到 {flame_api_url}")
-                    print(f"请求数据: {payload}")
+                    print(f"Sending request to {flame_api_url}")
+                    print(f"Request data: {payload}")
                     
                     try:
                         response = requests.post(flame_api_url, json=payload, timeout=30)
                         if response.status_code == 200:
-                            print("API请求成功!")
+                            print("API request successful!")
                             try:
                                 result = response.json()
-                                print(f"返回数据包含以下键: {list(result.keys())}")
-                                print(f"返回的元数据: {result.get('metadata', {})}")
+                                print(f"Returned data contains the following keys: {list(result.keys())}")
+                                print(f"Returned metadata: {result.get('metadata', {})}")
                                 if 'expression' in result:
-                                    print(f"表情参数形状: {np.array(result['expression']).shape}")
+                                    print(f"Expression parameters shape: {np.array(result['expression']).shape}")
                                 if 'jaw_pose' in result:
-                                    print(f"下颚参数形状: {np.array(result['jaw_pose']).shape}")
+                                    print(f"Jaw parameters shape: {np.array(result['jaw_pose']).shape}")
                             except:
-                                print("无法解析返回的JSON数据")
+                                print("Unable to parse returned JSON data")
                         else:
-                            print(f"API请求失败: 状态码 {response.status_code}")
-                            print(f"错误信息: {response.text}")
+                            print(f"API request failed: status code {response.status_code}")
+                            print(f"Error message: {response.text}")
                     except Exception as e:
-                        print(f"请求过程中发生错误: {e}")
+                        print(f"Error occurred during request: {e}")
                 else:
-                    print("未指定音频路径，跳过API请求测试")
-                    print("请使用--server_audio_path参数指定服务器上的音频路径")
-                    print("例如: --server_audio_path=/home/plm/inferno/assets/data/EMOTE_test_example_data/02_that.wav")
+                    print("No audio path specified, skipping API request test")
+                    print("Please use --server_audio_path parameter to specify audio path on server")
+                    print("For example: --server_audio_path=/home/plm/inferno/assets/data/EMOTE_test_example_data/02_that.wav")
             else:
-                print(f"API服务状态异常: 状态码 {health_check.status_code}")
-                print("程序将继续但API功能可能无法使用")
+                print(f"API service status abnormal: status code {health_check.status_code}")
+                print("Program will continue but API features may not be available")
         except Exception as e:
-            print(f"API连接测试失败: {e}")
-            print("程序将继续但API功能可能无法使用")
+            print(f"API connection test failed: {e}")
+            print("Program will continue but API features may not be available")
     
     gui = LocalViewer(cfg)
     gui.run()
