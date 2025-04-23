@@ -28,7 +28,10 @@ import shutil
 import os
 import requests
 import sys
-from scipy import signal
+import signal
+from scipy import signal as signal_scipy
+import queue
+import traceback
 
 # 添加中文字体支持
 is_windows = sys.platform.startswith('win')
@@ -78,16 +81,35 @@ class Config(Mini3DViewerConfig):
     """The UI will be simplified in demo mode."""
     lock_frame_rate: bool = True
     """Lock frame rate to match audio"""
-    audio_offset: float = 0.0
-    """Audio offset in seconds"""
+    # audio_offset: float = 0.0
+    # """Audio offset in seconds"""
     api_url: str = "http://localhost:5001"
     """API服务器URL"""
+    tts_api_url: str = "http://10.112.208.173:5001"
+    """TTS API服务器URL"""
+    use_pulseaudio: bool = True
+    """使用PulseAudio播放音频"""
+    pulseaudio_server: str = "100.127.107.62:4713"
+    """PulseAudio服务器地址"""
     test_api: bool = False
     """启动时测试API连接"""
+    render_timeout: float = 5.0
+    """Maximum time allowed for a single frame render (seconds)"""
+    temp_audio_path: Path = Path("./temp_audio.wav")
+    """临时音频文件保存路径"""
 
 class LocalViewer(Mini3DViewer):
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        
+        # 创建必要的目录
+        # 确保临时音频路径存在有效的父目录
+        if str(self.cfg.temp_audio_path) == "" or os.path.dirname(str(self.cfg.temp_audio_path)) == "":
+            self.cfg.temp_audio_path = Path("./temp_audio.wav")
+            print(f"临时音频路径无效，已设置为默认路径: {self.cfg.temp_audio_path}")
+        
+        os.makedirs(os.path.dirname(str(self.cfg.temp_audio_path)) if os.path.dirname(str(self.cfg.temp_audio_path)) else ".", exist_ok=True)
+        os.makedirs(self.cfg.save_folder, exist_ok=True)
         
         # 设置中文字体支持
         dpg.create_context()
@@ -106,22 +128,46 @@ class LocalViewer(Mini3DViewer):
         # 自动模式 - 简化用户界面
         self.auto_mode = True
         
+        # 渲染和性能优化相关变量
+        self.need_frame_update = False
+        self.next_frame = 0
+        self.should_skip_complex_frames = True  # 自动跳过复杂帧
+        self.max_render_time = 200.0  # 毫秒，大于这个值的帧会被标记为复杂帧
+        self.complex_frames = set()   # 记录复杂帧
+        
+        # 线程同步相关
+        self.render_queue = queue.Queue(maxsize=1)
+        self.is_rendering = False
+        self.render_start_time = 0     # 记录渲染开始时间
+        self.thread_running = True
+        self.render_thread = None
+        self.render_time = 0.0
+        self.abort_render = False      # 用户中断标志
+        
+        # 帧性能统计
+        self.frame_times = {}          # 记录每一帧的渲染时间
+        
         # audio settings
         self.audio_data = None
         self.sample_rate = None
+        self.current_sample = 0  # 当前音频样本索引，用于音频回调函数
+        self.audio_frame_duration = 1.0 / self.cfg.fps if self.cfg.fps > 0 else 0.04  # default 25fps
         self.audio_playing = False
         self.audio_stream = None
         self.audio_thread = None
         self.audio_time = 0
         self.audio_frame_index = 0
-        self.current_sample = 0  # 当前音频样本索引，用于音频回调函数
-        self.audio_frame_duration = 1.0 / self.cfg.fps if self.cfg.fps > 0 else 0.04  # default 25fps
         
         # 检测可用的音频设备
         self.check_audio_devices()
         
+        # 设置PulseAudio环境
+        self.pulse_sink_id = 0
+        self.setup_pulseaudio_env()
+        
         # 加载音频文件
-        self.load_audio()
+        if self.cfg.audio_path is not None:
+            self.load_audio()
         
         # 测试API连接
         if self.cfg.test_api:
@@ -147,103 +193,64 @@ class LocalViewer(Mini3DViewer):
         if self.gaussians.binding is not None:
             self.num_timesteps = self.gaussians.num_timesteps
             dpg.configure_item("_slider_timestep", max_value=self.num_timesteps - 1)
-
             self.gaussians.select_mesh_by_timestep(self.timestep)
-            
+        else:
+            print("Warning: No FLAME model binding available, some features may be limited")
+        
+        # 设置Ctrl+C处理
+        signal.signal(signal.SIGINT, self.signal_handler)
+        
         # 如果处于自动模式且加载了音频，自动设置关键帧
         if self.auto_mode and self.audio_data is not None and self.gaussians.binding is not None:
             # 延迟执行，确保GUI已经完全初始化
             def auto_setup():
+                """自动设置模式"""
+                print("自动模式：开始自动配置...")
                 try:
-                    time.sleep(0.5)  # 等待GUI完全初始化
-                    
-                    # 检查GUI是否已经初始化
-                    if not dpg.does_item_exist("_slider_timestep") or not dpg.does_item_exist("_slider_record_timestep"):
-                        print("等待GUI完全初始化...")
-                        time.sleep(1)  # 再等待一秒
-                    
-                    # 再次检查GUI元素
-                    if not dpg.does_item_exist("_slider_timestep"):
-                        print("错误: GUI元素'_slider_timestep'未找到，无法进行自动设置")
-                        return
-
-                    # 自动调用API获取FLAME参数（如果有音频文件）
-                    # 优先使用server_audio_path参数
-                    audio_path = None
-                    if self.cfg.server_audio_path:
-                        audio_path = self.cfg.server_audio_path
-                        print(f"自动模式：使用服务器上的音频路径: {audio_path}")
-                    elif self.cfg.audio_path is not None:
-                        audio_path = str(self.cfg.audio_path)
-                        print(f"自动模式：使用本地音频路径: {audio_path}")
-                    
-                    if audio_path:
+                    # 检查是否有本地音频文件
+                    if self.cfg.audio_path is not None and self.cfg.audio_path.exists():
+                        print(f"自动模式：使用本地音频路径: {self.cfg.audio_path}")
+                        
+                        # 尝试从API获取FLAME参数
                         print("自动模式：尝试从API获取FLAME参数...")
-                        # 使用默认参数调用API
-                        success = self.get_flame_params_from_api(
-                            audio_path,
-                            subject_style="M003",
-                            emotion="neutral", 
-                            intensity=2
-                        )
-                        if success:
-                            print("自动模式：成功从API获取FLAME参数")
-                            return
-                        else:
-                            print("自动模式：无法从API获取FLAME参数，将使用默认关键帧设置")
-                    
-                    # 设置首帧关键帧
-                    self.timestep = 0
-                    dpg.set_value("_slider_timestep", self.timestep)
-                    self.gaussians.select_mesh_by_timestep(self.timestep)
-                    first_state = self.get_state_dict()
-                    self.keyframes.append(first_state)
-                    
-                    # 设置末帧关键帧
-                    if self.num_timesteps > 1:
-                        # 保存当前帧
-                        old_timestep = self.timestep
-                        
-                        # 切换到最后一帧
-                        self.timestep = self.num_timesteps - 1
-                        dpg.set_value("_slider_timestep", self.timestep)
-                        self.gaussians.select_mesh_by_timestep(self.timestep)
-                        
-                        # 添加末帧关键帧
-                        last_state = self.get_state_dict()
-                        self.keyframes.append(last_state)
-                        
-                        # 恢复原始帧
-                        self.timestep = old_timestep
-                        dpg.set_value("_slider_timestep", self.timestep)
-                        self.gaussians.select_mesh_by_timestep(self.timestep)
-                    
-                    # 设置循环模式
-                    dpg.set_value("_input_cycles", 1)
-                    
-                    # 更新时间线
-                    self.update_record_timeline()
-                    
-                    # 检查是否成功创建时间线
-                    if self.num_record_timeline <= 0:
-                        print("警告: 无法创建有效的播放时间线")
-                        return
-                    
-                    # 重置到起点
-                    dpg.set_value("_slider_record_timestep", 0)
-                    
-                    # 开始播放
-                    self.playing = True
-                    self.need_update = True
-                    
-                    # 启动音频
-                    self.start_audio()
-                    
-                    print("自动设置完成: 已创建关键帧并开始播放")
+                        try:
+                            # 尝试使用本地路径或者服务器路径请求API
+                            audio_path = None
+                            if self.cfg.server_audio_path:
+                                audio_path = self.cfg.server_audio_path
+                                print(f"使用服务器上的音频路径: {audio_path}")
+                            else:
+                                audio_path = str(self.cfg.audio_path)
+                                print(f"使用本地音频路径: {audio_path}")
+                                print("提示: 示例服务器音频路径格式: /home/plm/inferno/assets/data/EMOTE_test_example_data/02_that.wav")
+                            
+                            self.get_flame_params_from_api(audio_path)
+                            
+                            # 如果成功，设置播放控制
+                            if dpg.does_item_exist("_input_cycles"):
+                                dpg.set_value("_input_cycles", 1)
+                            if dpg.does_item_exist("_slider_record_timestep"):
+                                dpg.set_value("_slider_record_timestep", 0)
+                            
+                        except Exception as e:
+                            print(f"自动模式：无法从API获取FLAME参数，将使用默认关键帧设置")
+                            print(f"错误: {e}")
+                    else:
+                        print("自动模式：未找到音频文件，将使用默认设置")
                 except Exception as e:
                     print(f"自动设置过程中出错: {e}")
-                    import traceback
-                    traceback.print_exc()
+                
+                # 确保UI是最新的
+                try:
+                    self.update_record_timeline()
+                except Exception as e:
+                    print(f"更新时间线出错: {e}")
+                
+                # 开始渲染第一帧
+                try:
+                    self.need_update = True
+                except Exception as e:
+                    print(f"触发首帧渲染出错: {e}")
             
             # 创建线程执行自动设置
             auto_thread = threading.Thread(target=auto_setup)
@@ -260,9 +267,9 @@ class LocalViewer(Mini3DViewer):
                 # 固定采样率为16000Hz
                 self.sample_rate = 16000
                 if original_sr != self.sample_rate:
-                    print(f"重采样音频从 {original_sr}Hz 到 {self.sample_rate}Hz")
+                    print(f"Resampling audio from {original_sr}Hz to {self.sample_rate}Hz")
                     num_samples = int(len(self.audio_data) * self.sample_rate / original_sr)
-                    self.audio_data = signal.resample(self.audio_data, num_samples)
+                    self.audio_data = signal_scipy.resample(self.audio_data, num_samples)
                 
                 # 如果是单声道，转换为立体声
                 if len(self.audio_data.shape) == 1:
@@ -280,17 +287,26 @@ class LocalViewer(Mini3DViewer):
     def audio_callback(self, outdata, frames, time, status):
         """音频回调函数，用于提供音频数据流"""
         if status:
-            print(f"音频回调状态: {status}")
+            print(f"Audio callback status: {status}")
             
         # 如果用户停止了播放或者应用关闭，返回静音数据
         if not self.audio_playing or not dpg.is_dearpygui_running():
             outdata.fill(0)
             return
+        
+        # 检查是否有有效的采样率和音频数据
+        if self.sample_rate is None or self.audio_data is None:
+            print("Warning: Audio callback found sample rate or audio data is None")
+            outdata.fill(0)
+            return
             
         try:
             # 计算当前音频帧对应的音频样本索引
-            current_frame = dpg.get_value("_slider_record_timestep")
-            sample_index = int(current_frame * self.audio_frame_duration * self.sample_rate)
+            sample_index = int(self.timestep / self.cfg.fps * self.sample_rate) if self.cfg.fps > 0 else 0
+            sample_index = max(0, sample_index) # 确保索引不为负
+            
+            # 调试信息
+            # print(f"Audio callback: frame={self.timestep}, sample={sample_index}, total={len(self.audio_data)}")
             
             # 更新当前样本索引（如果需要同步）
             self.current_sample = sample_index
@@ -299,7 +315,28 @@ class LocalViewer(Mini3DViewer):
             end_idx = sample_index + frames
             
             # 检查是否已经播放到文件末尾
-            if end_idx >= len(self.audio_data):
+            if sample_index >= len(self.audio_data) or sample_index < 0:
+                # 如果索引已经超出范围，填充静音
+                outdata.fill(0)
+                
+                # 判断是否循环播放 - 不在音频回调中直接修改UI，只设置标志
+                try:
+                    if dpg.get_value("_checkbox_loop"):
+                        # 在主线程中处理循环逻辑
+                        self.next_frame = 0
+                        self.need_frame_update = True
+                        self.need_update = True
+                        # 不直接调用UI更新
+                        print("Audio position out of range, resetting to start")
+                    else:
+                        # 停止播放
+                        self.audio_playing = False
+                        print("Audio position out of range, stopping playback")
+                except Exception as e:
+                    print(f"Error checking loop state: {e}")
+                    self.audio_playing = False
+                return
+            elif end_idx >= len(self.audio_data):
                 # 填充剩余的部分
                 remaining = len(self.audio_data) - sample_index
                 if remaining > 0:
@@ -309,21 +346,34 @@ class LocalViewer(Mini3DViewer):
                     outdata.fill(0)
                 
                 # 判断是否循环播放
-                if dpg.get_value("_checkbox_loop_record"):
-                    # 将视觉时间轴重置到开始
-                    dpg.set_value("_slider_record_timestep", 0)
-                    print("音频播放结束，循环重新开始")
-                    return  # 退出此次回调，下一次回调会从重置的位置开始
-                else:
-                    # 停止播放
+                try:
+                    if dpg.get_value("_checkbox_loop"):
+                        # 在主线程中处理循环逻辑
+                        self.next_frame = 0
+                        self.need_frame_update = True
+                        self.need_update = True
+                        # 不直接调用UI更新
+                        print("Audio playback ended, looping back to start")
+                    else:
+                        # 停止播放
+                        self.audio_playing = False
+                        print("Audio playback completed")
+                except Exception as e:
+                    print(f"Error checking loop state: {e}")
                     self.audio_playing = False
-                    print("音频播放完成")
-                    return
+                return
             else:
                 # 正常播放
-                outdata[:] = self.audio_data[sample_index:end_idx]
+                try:
+                    outdata[:] = self.audio_data[sample_index:end_idx]
+                except ValueError as e:
+                    print(f"Audio buffer error: {e}, filling with zeros")
+                    outdata.fill(0)
+                except Exception as e:
+                    print(f"Unexpected error in audio buffer: {e}")
+                    outdata.fill(0)
         except Exception as e:
-            print(f"音频回调异常: {e}")
+            print(f"Audio callback exception: {e}")
             import traceback
             traceback.print_exc()
             outdata.fill(0)  # 发生错误时输出静音
@@ -331,27 +381,27 @@ class LocalViewer(Mini3DViewer):
     def start_audio(self):
         """开始播放音频"""
         if self.audio_data is None:
-            print("无法播放音频：未加载音频数据")
+            print("Cannot play audio: No audio data loaded")
             return
             
         if self.audio_playing:
-            print("音频已经在播放中")
+            print("Audio is already playing")
             return
             
         def audio_player():
             try:
-                print("开始音频播放线程")
+                print("Starting audio playback thread")
                 
-                # 从当前视觉帧的对应位置开始播放音频
-                self.audio_frame_index = dpg.get_value("_slider_record_timestep")
+                # 从当前时间步的对应位置开始播放音频
+                self.audio_frame_index = self.timestep
                 
                 # 计算开始时间(秒)
-                start_time = self.audio_frame_index * self.audio_frame_duration
-                print(f"音频开始位置: 帧 {self.audio_frame_index}, 时间 {start_time:.2f}秒")
+                start_time = self.audio_frame_index / self.cfg.fps
+                print(f"Audio start position: Frame {self.audio_frame_index}, Time {start_time:.2f}s")
                 
                 # 初始化当前音频样本索引
                 self.current_sample = int(start_time * self.sample_rate)
-                print(f"初始化音频样本索引: {self.current_sample}")
+                print(f"Initialize audio sample index: {self.current_sample}")
                 
                 # 使用 blocksize 参数控制音频缓冲区大小，可以提高同步精度
                 # 设置一个相对较小的缓冲区大小，以减少延迟
@@ -360,68 +410,37 @@ class LocalViewer(Mini3DViewer):
                 # 获取系统默认设备信息
                 try:
                     default_device = sd.default.device
-                    print(f"系统默认音频设备: 输入 {default_device[0]}, 输出 {default_device[1]}")
+                    print(f"System default audio devices: Input {default_device[0]}, Output {default_device[1]}")
                 except Exception as e:
-                    print(f"获取默认音频设备失败: {e}")
+                    print(f"Failed to get default audio device: {e}")
                     default_device = (None, None)
                 
                 # 列出可用音频设备以供诊断
                 available_outputs = []
                 try:
                     devices = sd.query_devices()
-                    print(f"系统可用音频设备列表:")
+                    print(f"System available audio devices:")
                     for i, dev in enumerate(devices):
                         is_output = dev['max_output_channels'] > 0
-                        print(f"  设备 {i}: {dev['name']} ({'输出' if is_output else '输入'})")
+                        print(f"  Device {i}: {dev['name']} ({'Output' if is_output else 'Input'})")
                         if is_output:
                             available_outputs.append(i)
-                    print(f"找到 {len(available_outputs)} 个可用的输出设备: {available_outputs}")
+                    print(f"Found {len(available_outputs)} available output devices: {available_outputs}")
                 except Exception as e:
-                    print(f"获取音频设备列表失败: {e}")
+                    print(f"Failed to get audio device list: {e}")
                     devices = []
-                
-                # 检查是否需要使用虚拟音频设备
-                if not available_outputs:
-                    print("警告: 没有找到可用的音频输出设备。尝试使用虚拟设备...")
-                    try:
-                        # 使用numpy虚拟音频设备
-                        print("创建虚拟音频流 (仅用于测试，不会有实际声音输出)")
-                        temp_buffer = np.zeros((1000, self.audio_data.shape[1]), dtype=self.audio_data.dtype)
-                        self.audio_stream = None  # 不使用实际流
-                        self.audio_playing = True
-                        
-                        # 模拟音频播放线程
-                        while self.audio_playing and dpg.is_dearpygui_running():
-                            # 更新时间线位置
-                            current_step = dpg.get_value("_slider_record_timestep")
-                            next_step = min(current_step + 1, self.num_record_timeline - 1)
-                            if next_step == self.num_record_timeline - 1 and dpg.get_value("_checkbox_loop_record"):
-                                next_step = 0
-                            
-                            # 更新位置
-                            if current_step != next_step:
-                                dpg.set_value("_slider_record_timestep", next_step)
-                                self.current_sample = int(next_step * self.audio_frame_duration * self.sample_rate)
-                            
-                            # 模拟适当的播放速度
-                            sd.sleep(int(1000 / self.cfg.fps))
-                        
-                        return  # 直接返回，不执行下面的音频设备尝试
-                    except Exception as e:
-                        print(f"创建虚拟音频流失败: {e}")
-                        self.audio_playing = False
                 
                 # 创建音频流，尝试使用找到的第一个输出设备
                 device_to_use = None
                 if available_outputs:
                     device_to_use = available_outputs[0]
-                    print(f"将使用设备 {device_to_use} 作为音频输出设备")
+                    print(f"Using device {device_to_use} as audio output device")
                 else:
-                    print("未找到可用的音频设备，将尝试使用系统默认...")
+                    print("No available audio devices found, will try using system default...")
                 
                 # 尝试创建音频流
                 try:
-                    print(f"创建音频输出流，使用设备: {device_to_use}")
+                    print(f"Creating audio output stream, using device: {device_to_use}")
                     with sd.OutputStream(
                         samplerate=self.sample_rate,
                         channels=self.audio_data.shape[1],
@@ -429,7 +448,7 @@ class LocalViewer(Mini3DViewer):
                         blocksize=1024,
                         device=device_to_use
                     ) as stream:
-                        print(f"音频流创建成功，开始播放，采样率: {self.sample_rate}Hz, 通道数: {self.audio_data.shape[1]}")
+                        print(f"Audio stream created successfully, starting playback, sample rate: {self.sample_rate}Hz, channels: {self.audio_data.shape[1]}")
                         self.audio_stream = stream
                         self.audio_playing = True
                         
@@ -437,11 +456,19 @@ class LocalViewer(Mini3DViewer):
                         while self.audio_playing and dpg.is_dearpygui_running():
                             sd.sleep(100)
                 except Exception as e:
-                    print(f"创建音频流失败: {e}")
-                    # 尝试使用PulseAudio的默认设备名称
+                    print(f"Failed to create audio stream: {e}")
+                    # 尝试使用PulseAudio的远程服务器
                     try:
-                        print("尝试使用PulseAudio的默认设备...")
-                        pulse_device = "default"
+                        print("Trying to use PulseAudio remote server...")
+                        # 尝试使用PulseAudio waveout设备
+                        import os
+                        # 设置PULSE_SERVER环境变量
+                        pulse_server = os.environ.get("PULSE_SERVER", "100.127.107.62:4713")
+                        print(f"Using PulseAudio server: {pulse_server}")
+                        
+                        pulse_device = self.pulse_sink_id  # 使用之前找到的waveout设备ID
+                        print(f"Trying to use PulseAudio device ID: {pulse_device}")
+                        
                         with sd.OutputStream(
                             samplerate=self.sample_rate,
                             channels=self.audio_data.shape[1],
@@ -449,7 +476,7 @@ class LocalViewer(Mini3DViewer):
                             blocksize=1024,
                             device=pulse_device
                         ) as stream:
-                            print(f"使用PulseAudio设备成功创建音频流")
+                            print(f"Successfully created audio stream using PulseAudio device")
                             self.audio_stream = stream
                             self.audio_playing = True
                             
@@ -457,59 +484,106 @@ class LocalViewer(Mini3DViewer):
                             while self.audio_playing and dpg.is_dearpygui_running():
                                 sd.sleep(100)
                     except Exception as e2:
-                        print(f"使用PulseAudio设备尝试失败: {e2}")
+                        print(f"Failed to use PulseAudio device: {e2}")
                         try:
-                            print("尝试使用虚拟音频输出...")
-                            # 如果所有输出设备尝试失败，回落到虚拟模式
-                            temp_buffer = np.zeros((1000, self.audio_data.shape[1]), dtype=self.audio_data.dtype)
-                            self.audio_stream = None  # 不使用实际流
-                            self.audio_playing = True
-                            
-                            # 模拟音频播放线程
-                            while self.audio_playing and dpg.is_dearpygui_running():
-                                # 更新时间线位置
-                                current_step = dpg.get_value("_slider_record_timestep")
-                                next_step = min(current_step + 1, self.num_record_timeline - 1)
-                                if next_step == self.num_record_timeline - 1 and dpg.get_value("_checkbox_loop_record"):
-                                    next_step = 0
+                            print("Trying to use default PulseAudio device...")
+                            pulse_device = "default"
+                            with sd.OutputStream(
+                                samplerate=self.sample_rate,
+                                channels=self.audio_data.shape[1],
+                                callback=self.audio_callback,
+                                blocksize=1024,
+                                device=pulse_device
+                            ) as stream:
+                                print(f"Successfully created audio stream using default PulseAudio device")
+                                self.audio_stream = stream
+                                self.audio_playing = True
                                 
-                                # 更新位置
-                                if current_step != next_step:
-                                    dpg.set_value("_slider_record_timestep", next_step)
-                                    self.current_sample = int(next_step * self.audio_frame_duration * self.sample_rate)
-                                
-                                # 模拟适当的播放速度
-                                sd.sleep(int(1000 / self.cfg.fps))
+                                # 等待直到音频播放停止
+                                while self.audio_playing and dpg.is_dearpygui_running():
+                                    sd.sleep(100)
                         except Exception as e3:
-                            print(f"所有音频输出方法失败: {e3}")
-                            import traceback
-                            traceback.print_exc()
+                            print(f"Failed to use default PulseAudio device: {e3}")
+                            try:
+                                print("Trying to use virtual audio output...")
+                                # 如果所有输出设备尝试失败，回落到虚拟模式
+                                temp_buffer = np.zeros((1000, self.audio_data.shape[1]), dtype=self.audio_data.dtype)
+                                self.audio_stream = None  # 不使用实际流
+                                self.audio_playing = True
+                                
+                                # 模拟音频播放线程
+                                while self.audio_playing and dpg.is_dearpygui_running():
+                                    # 更新时间步位置
+                                    if self.playing:
+                                        next_frame = min(self.timestep + 1, self.num_timesteps - 1)
+                                        
+                                        # 检查是否需要循环
+                                        if next_frame == self.num_timesteps - 1 and dpg.get_value("_checkbox_loop"):
+                                            next_frame = 0
+                                        
+                                        # 设置下一帧
+                                        if self.timestep != next_frame:
+                                            self.next_frame = next_frame
+                                            self.need_frame_update = True
+                                            self.need_update = True
+                                            
+                                            # 更新音频位置
+                                            self.current_sample = int(next_frame / self.cfg.fps * self.sample_rate)
+                                    
+                                    # 模拟适当的播放速度
+                                    sd.sleep(int(1000 / self.cfg.fps))
+                            except Exception as e4:
+                                print(f"All audio output methods failed: {e4}")
+                                import traceback
+                                traceback.print_exc()
             except Exception as e:
-                print(f"音频播放失败: {e}")
+                print(f"Failed to start audio playback: {e}")
                 import traceback
                 traceback.print_exc()
             finally:
-                print("音频播放线程结束")
+                print("Audio playback thread ended")
                 self.audio_playing = False
                 self.audio_stream = None
         
         # 终止任何现有的音频线程
         if self.audio_thread is not None and self.audio_thread.is_alive():
-            print("停止现有音频线程")
+            print("Stopping existing audio thread")
             self.stop_audio()
             time.sleep(0.1)  # 等待线程完全终止
         
-        print("启动新的音频播放线程")
+        print("Starting new audio playback thread")
         self.audio_thread = threading.Thread(target=audio_player)
         self.audio_thread.daemon = True
         self.audio_thread.start()
         
     def stop_audio(self):
         """停止音频播放"""
+        if not self.audio_playing:
+            print("Audio is not playing")
+            return
+            
+        # 标记停止音频播放
+        print("Stopping audio playback")
         self.audio_playing = False
-        if self.audio_stream:
-            self.audio_stream.abort()
-            self.audio_stream = None
+        
+        # 关闭音频流
+        if self.audio_stream is not None:
+            try:
+                print("Aborting audio stream")
+                self.audio_stream.abort()
+                self.audio_stream = None
+            except Exception as e:
+                print(f"Error aborting audio stream: {e}")
+                
+        # 等待音频线程结束
+        if self.audio_thread is not None and self.audio_thread.is_alive():
+            print("Waiting for audio thread to end")
+            timeout = 1.0  # 最多等待1秒
+            self.audio_thread.join(timeout)
+            if self.audio_thread.is_alive():
+                print("Warning: Audio thread did not terminate cleanly")
+        
+        print("Audio stopped")
 
     def init_gaussians(self):
         # load gaussians
@@ -1043,581 +1117,270 @@ class LocalViewer(Mini3DViewer):
     def define_gui(self):
         super().define_gui()
 
-        # window: rendering options ==================================================================================================
-        with dpg.window(label="Render", tag="_render_window", autosize=True):
-
+        # window: rendering options
+        with dpg.window(label="Render", tag="_render_window", width=430, height=0, no_resize=True, no_scrollbar=True):
             with dpg.group(horizontal=True):
-                dpg.add_text("FPS:", show=not self.cfg.demo_mode)
-                dpg.add_text("0   ", tag="_log_fps", show=not self.cfg.demo_mode)
+                dpg.add_text("FPS:")
+                dpg.add_text("0   ", tag="_log_fps")
+                dpg.add_spacer(width=10)
+                dpg.add_text("Frame:")
+                dpg.add_text("0", tag="_log_current_frame")
+                dpg.add_spacer(width=10)
+                dpg.add_text("Render:")
+                dpg.add_text("0.0ms", tag="_log_render_time")
+                dpg.add_spacer(width=10)
+                dpg.add_text("Status:")
+                dpg.add_text("就绪", tag="_log_status")
 
-            dpg.add_text(f"number of points: {self.gaussians._xyz.shape[0]}")
+            dpg.add_text(f"点数: {self.gaussians._xyz.shape[0]}")
             
             with dpg.group(horizontal=True):
-                # show splatting
+                # 显示高斯点
                 def callback_show_splatting(sender, app_data):
                     self.need_update = True
-                dpg.add_checkbox(label="show splatting", default_value=True, callback=callback_show_splatting, tag="_checkbox_show_splatting")
+                dpg.add_checkbox(label="显示高斯点", default_value=True, callback=callback_show_splatting, tag="_checkbox_show_splatting")
 
                 dpg.add_spacer(width=10)
 
                 if self.gaussians.binding is not None:
-                    # show mesh
+                    # 显示网格
                     def callback_show_mesh(sender, app_data):
                         self.need_update = True
-                    dpg.add_checkbox(label="show mesh", default_value=False, callback=callback_show_mesh, tag="_checkbox_show_mesh")
-
-                    # # show original mesh
-                    # def callback_original_mesh(sender, app_data):
-                    #     self.original_mesh = app_data
-                    #     self.need_update = True
-                    # dpg.add_checkbox(label="original mesh", default_value=self.original_mesh, callback=callback_original_mesh)
+                    dpg.add_checkbox(label="显示网格", default_value=False, callback=callback_show_mesh, tag="_checkbox_show_mesh")
             
-            # timestep slider and buttons
-            if self.num_timesteps != None:
+            # 时间步滑块和播放控件
+            if hasattr(self, 'num_timesteps') and self.num_timesteps is not None:
                 def callback_set_current_frame(sender, app_data):
+                    # 非阻塞方式
                     if sender == "_slider_timestep":
-                        self.timestep = app_data
+                        self.next_frame = app_data
                     elif sender in ["_button_timestep_plus", "_mvKey_Right"]:
-                        self.timestep = min(self.timestep + 1, self.num_timesteps - 1)
+                        self.next_frame = min(self.timestep + 1, self.num_timesteps - 1)
                     elif sender in ["_button_timestep_minus", "_mvKey_Left"]:
-                        self.timestep = max(self.timestep - 1, 0)
+                        self.next_frame = max(self.timestep - 1, 0)
                     elif sender == "_mvKey_Home":
-                        self.timestep = 0
+                        self.next_frame = 0
                     elif sender == "_mvKey_End":
-                        self.timestep = self.num_timesteps - 1
+                        self.next_frame = self.num_timesteps - 1
 
-                    dpg.set_value("_slider_timestep", self.timestep)
-                    print(f"选择时间步: {self.timestep}/{self.num_timesteps - 1}")
-                    self.gaussians.select_mesh_by_timestep(self.timestep)
-                    print(f"时间步 {self.timestep} 的网格已加载")
-
+                    dpg.set_value("_slider_timestep", self.next_frame)
+                    dpg.set_value("_log_current_frame", f"{self.next_frame}")
+                    
+                    # 标记需要更新帧
+                    self.need_frame_update = True
                     self.need_update = True
+                    dpg.set_value("_log_status", f"请求帧 {self.next_frame}")
+
                 with dpg.group(horizontal=True):
                     dpg.add_button(label='-', tag="_button_timestep_minus", callback=callback_set_current_frame)
                     dpg.add_button(label='+', tag="_button_timestep_plus", callback=callback_set_current_frame)
-                    dpg.add_slider_int(label="timestep", tag='_slider_timestep', width=153, min_value=0, max_value=self.num_timesteps - 1, format="%d", default_value=0, callback=callback_set_current_frame)
+                    dpg.add_slider_int(label="时间步", tag='_slider_timestep', width=153, min_value=0, 
+                                      max_value=self.num_timesteps - 1 if hasattr(self, 'num_timesteps') else 0, 
+                                      format="%d", default_value=0, callback=callback_set_current_frame)
+                
+                # 播放控件
+                with dpg.group(horizontal=True):
+                    def callback_play_pause(sender, app_data):
+                        self.playing = not self.playing
+                        if self.playing:
+                            dpg.set_item_label("_button_play_pause", "Pause")
+                            dpg.set_value("_log_status", "Playing")
+                            self.last_frame_time = time.time()
+                            # 如果有音频，开始播放
+                            if self.audio_data is not None and not self.audio_playing:
+                                self.start_audio()
+                        else:
+                            dpg.set_item_label("_button_play_pause", "Play")
+                            dpg.set_value("_log_status", "Paused")
+                            # 如果音频正在播放，停止
+                            if self.audio_playing:
+                                self.stop_audio()
+                    dpg.add_button(label="Play", tag="_button_play_pause", callback=callback_play_pause)
+                    
+                    # 中止渲染按钮
+                    def callback_abort_render(sender, app_data):
+                        self.abort_render = True
+                        dpg.set_value("_log_status", "Aborting render...")
+                    dpg.add_button(label="Abort Render", tag="_button_abort_render", callback=callback_abort_render)
+                    
+                    # 循环播放复选框
+                    dpg.add_checkbox(label="Loop", default_value=True, tag="_checkbox_loop")
+                    
+                    # 跳过复杂帧选项
+                    def callback_skip_complex(sender, app_data):
+                        self.should_skip_complex_frames = app_data
+                    dpg.add_checkbox(label="Skip Slow Frames", default_value=self.should_skip_complex_frames, 
+                                    callback=callback_skip_complex, tag="_checkbox_skip_complex")
+                
+                # 音频控件 (如果有音频)
+                if self.audio_data is not None:
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("Audio Position:")
+                        dpg.add_text("0.00s", tag="_text_audio_position")
+                    
+                    # 锁定帧率复选框
+                    def callback_lock_frame_rate(sender, app_data):
+                        self.cfg.lock_frame_rate = app_data
+                    dpg.add_checkbox(label="Lock Frame Rate", default_value=self.cfg.lock_frame_rate, 
+                                    callback=callback_lock_frame_rate, tag="_checkbox_lock_frame_rate")
+                
+                # 速度控制
+                with dpg.group(horizontal=True):
+                    def callback_set_speed(sender, app_data):
+                        self.playback_speed = app_data
+                    dpg.add_slider_float(label="Speed", min_value=0.1, max_value=2.0, 
+                                        format="%.1fx", default_value=1.0, 
+                                        callback=callback_set_speed, tag="_slider_speed", width=200)
 
-            # # render_mode combo
-            # def callback_change_mode(sender, app_data):
-            #     self.render_mode = app_data
-            #     self.need_update = True
-            # dpg.add_combo(('rgb', 'depth', 'opacity'), label='render mode', default_value=self.render_mode, callback=callback_change_mode)
-
-            # scaling_modifier slider
+            # 缩放滑块
             def callback_set_scaling_modifier(sender, app_data):
                 self.need_update = True
-            dpg.add_slider_float(label="Scale modifier", min_value=0, max_value=1, format="%.2f", width=200, default_value=1, callback=callback_set_scaling_modifier, tag="_slider_scaling_modifier")
+            dpg.add_slider_float(label="Scale Modifier", min_value=0, max_value=1, format="%.2f", 
+                                width=200, default_value=1, callback=callback_set_scaling_modifier, 
+                                tag="_slider_scaling_modifier")
 
-            # fov slider
+            # 视角滑块
             def callback_set_fovy(sender, app_data):
                 self.cam.fovy = app_data
                 self.need_update = True
-            dpg.add_slider_int(label="FoV (vertical)", min_value=1, max_value=120, width=200, format="%d deg", default_value=self.cam.fovy, callback=callback_set_fovy, tag="_slider_fovy", show=not self.cfg.demo_mode)
+            dpg.add_slider_int(label="FoV (vertical)", min_value=1, max_value=120, width=200, 
+                              format="%d deg", default_value=self.cam.fovy, 
+                              callback=callback_set_fovy, tag="_slider_fovy")
 
-            if self.gaussians.binding is not None:
-                # visualization options
-                def callback_visual_options(sender, app_data):
-                    if app_data == 'number of points per face':
-                        value, ct = self.gaussians.binding.unique(return_counts=True)
-                        ct = torch.log10(ct + 1)
-                        ct = ct.float() / ct.max()
-                        cmap = matplotlib.colormaps["plasma"]
-                        self.face_colors = torch.from_numpy(cmap(ct.cpu())[None, :, :3]).to(self.gaussians.verts)
-                    else:
-                        self.face_colors = self.mesh_color[:3].to(self.gaussians.verts)[None, None, :].repeat(1, self.gaussians.face_center.shape[0], 1)  # (1, F, 3)
-                    
-                    dpg.set_value('_checkbox_show_mesh', True)
-                    self.need_update = True
-                dpg.add_combo(["none", "number of points per face"], default_value="none", label='visualization', width=200, callback=callback_visual_options, tag="_visual_options")
-
-                # mesh_color picker
-                def callback_change_mesh_color(sender, app_data):
-                    self.mesh_color = torch.tensor(app_data, dtype=torch.float32)  # only need RGB in [0, 1]
-                    if dpg.get_value("_visual_options") == 'none':
-                        self.face_colors = self.mesh_color[:3].to(self.gaussians.verts)[None, None, :].repeat(1, self.gaussians.face_center.shape[0], 1)
-                    self.need_update = True
-                dpg.add_color_edit((self.mesh_color*255).tolist(), label="Mesh Color", width=200, callback=callback_change_mesh_color, show=not self.cfg.demo_mode)
-
-            # camera
+            # 相机控件
             with dpg.group(horizontal=True):
                 def callback_reset_camera(sender, app_data):
                     self.cam.reset()
-                    self.need_update = True
                     dpg.set_value("_slider_fovy", self.cam.fovy)
-                dpg.add_button(label="reset camera", tag="_button_reset_pose", callback=callback_reset_camera, show=not self.cfg.demo_mode)
-                
-                def callback_cache_camera(sender, app_data):
-                    self.cam.save()
-                dpg.add_button(label="cache camera", tag="_button_cache_pose", callback=callback_cache_camera, show=not self.cfg.demo_mode)
-
-                def callback_clear_cache(sender, app_data):
-                    self.cam.clear()
-                dpg.add_button(label="clear cache", tag="_button_clear_cache", callback=callback_clear_cache, show=not self.cfg.demo_mode)
-                
-        # window: audio controls ==================================================================================================
-        if self.audio_data is not None:
-            with dpg.window(label="Audio Controls", tag="_audio_window", autosize=True, pos=(self.W-300, self.H//2)):
-                # 显示音频信息
-                audio_duration = len(self.audio_data) / self.sample_rate
-                dpg.add_text(f"Audio file: {self.cfg.audio_path.name}")
-                dpg.add_text(f"Duration: {audio_duration:.2f}s")
-                dpg.add_text(f"Sample rate: {self.sample_rate}Hz")
-                
-                # 自动模式
-                def callback_auto_mode(sender, app_data):
-                    self.auto_mode = app_data
-                    # 更新界面显示
-                    if self.auto_mode:
-                        # 隐藏复杂的Record窗口控件
-                        dpg.configure_item("_keyframes_group", show=False)
-                        dpg.configure_item("_keyframe_edit_group", show=False)
-                    else:
-                        # 显示所有Record窗口控件
-                        dpg.configure_item("_keyframes_group", show=True)
-                        dpg.configure_item("_keyframe_edit_group", show=True)
-                dpg.add_checkbox(label="Auto mode (simplified interface)", default_value=self.auto_mode, 
-                                callback=callback_auto_mode, tag="_checkbox_auto_mode")
-                
-                # 锁定摄像机选项
-                def callback_lock_camera(sender, app_data):
-                    pass  # 仅需要记录状态，不需要额外操作
-                dpg.add_checkbox(label="Lock camera during playback", default_value=False, 
-                                callback=callback_lock_camera, tag="_checkbox_lock_camera")
-                
-                # 重置关键帧按钮
-                def callback_reset_keyframes(sender, app_data):
-                    # 停止任何正在进行的播放
-                    self.playing = False
-                    if self.audio_playing:
-                        self.stop_audio()
-                    
-                    # 清除现有关键帧
-                    self.keyframes = []
-                    dpg.configure_item("_listbox_keyframes", items=[])
-                    
-                    # 设置首帧关键帧
-                    self.timestep = 0
-                    dpg.set_value("_slider_timestep", self.timestep)
-                    self.gaussians.select_mesh_by_timestep(self.timestep)
-                    first_state = self.get_state_dict()
-                    self.keyframes.append(first_state)
-                    
-                    # 设置末帧关键帧
-                    if self.num_timesteps > 1:
-                        self.timestep = self.num_timesteps - 1
-                        dpg.set_value("_slider_timestep", self.timestep)
-                        self.gaussians.select_mesh_by_timestep(self.timestep)
-                        last_state = self.get_state_dict()
-                        self.keyframes.append(last_state)
-                        
-                        # 返回第一帧
-                        self.timestep = 0
-                        dpg.set_value("_slider_timestep", self.timestep)
-                        self.gaussians.select_mesh_by_timestep(self.timestep)
-                    
-                    # 更新关键帧列表
-                    dpg.configure_item("_listbox_keyframes", items=list(range(len(self.keyframes))))
-                    
-                    # 设置循环
-                    dpg.set_value("_input_cycles", 1)
-                    
-                    # 更新时间线
-                    self.update_record_timeline()
-                    
-                    # 重置到起点
-                    dpg.set_value("_slider_record_timestep", 0)
-                    
-                    # 提示用户
-                    print("关键帧已重置，已自动设置第一帧和最后一帧作为关键帧")
-                
-                dpg.add_button(label="Reset Keyframes", tag="_button_reset_keyframes", callback=callback_reset_keyframes)
-                
-                # 音频偏移设置
-                def callback_set_audio_offset(sender, app_data):
-                    self.cfg.audio_offset = app_data
-                    # 如果正在播放，立即应用偏移
-                    if self.audio_playing:
-                        self.stop_audio()
-                        self.start_audio()
-                dpg.add_slider_float(label="Audio offset (seconds)", min_value=-5.0, max_value=5.0, format="%.2f", 
-                                    default_value=self.cfg.audio_offset, callback=callback_set_audio_offset, width=200)
-                
-                # 锁定帧率
-                def callback_lock_frame_rate(sender, app_data):
-                    self.cfg.lock_frame_rate = app_data
-                dpg.add_checkbox(label="Lock frame rate", default_value=self.cfg.lock_frame_rate, 
-                                callback=callback_lock_frame_rate, tag="_checkbox_lock_frame_rate")
-                
-                # 音频位置
-                dpg.add_text("Audio position: 0.00s", tag="_text_audio_position")
-                
-                # 添加帧数显示
-                dpg.add_text(f"Frame: 0 / {self.num_timesteps}", tag="_text_frame_position")
-                
-                # 音频播放进度条
-                def callback_set_audio_position(sender, app_data):
-                    # 设置新的时间线位置
-                    frame_position = int(app_data * self.num_record_timeline / audio_duration)
-                    frame_position = max(0, min(frame_position, self.num_record_timeline-1))
-                    dpg.set_value("_slider_record_timestep", frame_position)
-                    
-                    # 更新状态
-                    state_dict = self.get_state_dict_record()
-                    self.apply_state_dict(state_dict)
                     self.need_update = True
-                    
-                    # 如果正在播放，更新音频位置
-                    if self.audio_playing:
-                        self.audio_frame_index = frame_position
+                    dpg.set_value("_log_status", "Camera reset")
+                dpg.add_button(label="Reset Camera", tag="_button_reset_pose", callback=callback_reset_camera)
                 
-                dpg.add_slider_float(label="Playback progress", width=200, tag="_slider_audio_position",
-                                     min_value=0.0, max_value=audio_duration, 
-                                     format="%.2fs", default_value=0.0, 
-                                     callback=callback_set_audio_position)
-                
-                # 控制按钮
+                # 保存图像按钮
+                def callback_save_image(sender, app_data):
+                    if not self.cfg.save_folder.exists():
+                        self.cfg.save_folder.mkdir(parents=True)
+                    path = self.cfg.save_folder / f"{time.strftime('%Y-%m-%d_%H-%M-%S')}_{self.timestep}.png"
+                    print(f"Saving image to {path}")
+                    if hasattr(self, 'render_buffer') and self.render_buffer is not None:
+                        Image.fromarray((np.clip(self.render_buffer, 0, 1) * 255).astype(np.uint8)).save(path)
+                        dpg.set_value("_log_status", "Image saved")
+                dpg.add_button(label="Save Image", tag="_button_save_image", callback=callback_save_image)
+
+            # API功能 (如果需要)
+            if self.gaussians.binding is not None:
                 with dpg.group(horizontal=True):
-                    def callback_audio_play(sender, app_data):
-                        if not self.audio_playing:
-                            self.start_audio()
-                            # 同时开始渲染动画
-                            self.playing = True
-                            self.need_update = True
-                    dpg.add_button(label="Play", tag="_button_audio_play", callback=callback_audio_play)
-                    
-                    def callback_audio_stop(sender, app_data):
-                        self.stop_audio()
-                        self.playing = False
-                    dpg.add_button(label="Stop", tag="_button_audio_stop", callback=callback_audio_stop)
-                    
-                    def callback_audio_restart(sender, app_data):
-                        self.stop_audio()
-                        # 重置到起点
-                        dpg.set_value("_slider_record_timestep", 0)
-                        # 更新状态
-                        state_dict = self.get_state_dict_record()
-                        self.apply_state_dict(state_dict)
-                        self.need_update = True
-                    dpg.add_button(label="Restart", tag="_button_audio_restart", callback=callback_audio_restart)
-                
-                # 添加自动播放按钮
-                def callback_auto_play(sender, app_data):
-                    # 自动创建关键帧
-                    try:
-                        if len(self.keyframes) == 0:
-                            # 检查时间步数
-                            if self.num_timesteps is None or self.num_timesteps < 1:
-                                print("警告: 没有足够的时间步数来设置关键帧")
-                                return
-                                
-                            # 添加第一帧
-                            self.timestep = 0
-                            dpg.set_value("_slider_timestep", self.timestep)
-                            self.gaussians.select_mesh_by_timestep(self.timestep)
-                            first_state = self.get_state_dict()
-                            self.keyframes.append(first_state)
-                            
-                            # 如果有多个时间步，添加末帧
-                            if self.num_timesteps > 1:
-                                old_timestep = self.timestep
-                                self.timestep = self.num_timesteps - 1
-                                dpg.set_value("_slider_timestep", self.timestep)
-                                self.gaussians.select_mesh_by_timestep(self.timestep)
-                                
-                                # 添加末帧
-                                last_state = self.get_state_dict()
-                                self.keyframes.append(last_state)
-                                
-                                # 更新关键帧列表
-                                dpg.configure_item("_listbox_keyframes", items=list(range(len(self.keyframes))))
-                                
-                                # 恢复原位置
-                                self.timestep = old_timestep
-                                dpg.set_value("_slider_timestep", self.timestep)
-                                self.gaussians.select_mesh_by_timestep(self.timestep)
-                            
-                            # 设置循环
-                            dpg.set_value("_input_cycles", 1)
-                        
-                        # 更新时间线
-                        self.update_record_timeline()
-                        
-                        # 如果没有有效的时间线长度，无法播放
-                        if self.num_record_timeline <= 0:
-                            print("警告: 无法创建有效的播放时间线。请检查关键帧设置。")
-                            return
-                            
-                        # 重置到起点
-                        dpg.set_value("_slider_record_timestep", 0)
-                        
-                        # 开始播放
-                        self.playing = True
-                        self.need_update = True
-                        
-                        # 开始音频
-                        if self.audio_data is not None and not self.audio_playing:
-                            self.start_audio()
-                    except Exception as e:
-                        print(f"自动播放时出错: {e}")
-                        import traceback
-                        traceback.print_exc()
-                
-                dpg.add_button(label="Auto Play", tag="_button_auto_play", callback=callback_auto_play)
-
-        # window: recording ==================================================================================================
-        with dpg.window(label="Record", tag="_record_window", autosize=True, pos=(0, self.H//2)):
-            dpg.add_text("Keyframes")
-            with dpg.group(horizontal=True, tag="_keyframes_group", show=not self.auto_mode):
-                # list keyframes
-                def callback_set_current_keyframe(sender, app_data):
-                    idx = int(dpg.get_value("_listbox_keyframes"))
-                    self.apply_state_dict(self.keyframes[idx])
-
-                    record_timestep = sum([keyframe['interval'] for keyframe in self.keyframes[:idx]])
-                    dpg.set_value("_slider_record_timestep", record_timestep)
-
-                    self.need_update = True
-                dpg.add_listbox(self.keyframes, width=200, tag="_listbox_keyframes", callback=callback_set_current_keyframe)
-
-                # edit keyframes
-                with dpg.group(tag="_keyframe_edit_group", show=not self.auto_mode):
-                    # add
-                    def callback_add_keyframe(sender, app_data):
-                        if len(self.keyframes) == 0:
-                            new_idx = 0
-                        else:
-                            new_idx = int(dpg.get_value("_listbox_keyframes")) + 1
-
-                        states = self.get_state_dict()
-                        
-                        self.keyframes.insert(new_idx, states)
-                        dpg.configure_item("_listbox_keyframes", items=list(range(len(self.keyframes))))
-                        dpg.set_value("_listbox_keyframes", new_idx)
-
-                        self.update_record_timeline()
-                    dpg.add_button(label="add", tag="_button_add_keyframe", callback=callback_add_keyframe)
-
-                    # delete
-                    def callback_delete_keyframe(sender, app_data):
-                        idx = int(dpg.get_value("_listbox_keyframes"))
-                        self.keyframes.pop(idx)
-                        dpg.configure_item("_listbox_keyframes", items=list(range(len(self.keyframes))))
-                        dpg.set_value("_listbox_keyframes", idx-1)
-
-                        self.update_record_timeline()
-                    dpg.add_button(label="delete", tag="_button_delete_keyframe", callback=callback_delete_keyframe)
-
-                    # update
-                    def callback_update_keyframe(sender, app_data):
-                        if len(self.keyframes) == 0:
-                            return
-                        else:
-                            idx = int(dpg.get_value("_listbox_keyframes"))
-
-                        states = self.get_state_dict()
-                        states['interval'] = self.cfg.fps*self.cfg.keyframe_interval
-
-                        self.keyframes[idx] = states
-                    dpg.add_button(label="update", tag="_button_update_keyframe", callback=callback_update_keyframe)
-
-            with dpg.group(horizontal=True):
-                def callback_set_record_cycles(sender, app_data):
-                    self.update_record_timeline()
-                dpg.add_input_int(label="cycles", tag="_input_cycles", default_value=0, width=70, callback=callback_set_record_cycles)
-
-                def callback_set_keyframe_interval(sender, app_data):
-                    self.cfg.keyframe_interval = app_data
-                    for keyframe in self.keyframes:
-                        keyframe['interval'] = self.cfg.fps*self.cfg.keyframe_interval
-                    self.update_record_timeline()
-                dpg.add_input_int(label="interval", tag="_input_interval", default_value=self.cfg.keyframe_interval, width=70, callback=callback_set_keyframe_interval)
-            
-            def callback_set_record_timestep(sender, app_data):
-                state_dict = self.get_state_dict_record()
-                
-                self.apply_state_dict(state_dict)
-                self.need_update = True
-                
-                # Update audio frame index to keep audio and visual in sync
-                if self.audio_playing:
-                    self.audio_frame_index = app_data
-            dpg.add_slider_int(label="timeline", tag='_slider_record_timestep', width=200, min_value=0, max_value=0, format="%d", default_value=0, callback=callback_set_record_timestep)
-            
-            with dpg.group(horizontal=True):
-                dpg.add_checkbox(label="dynamic", default_value=False, tag="_checkbox_dynamic_record")
-                dpg.add_checkbox(label="loop", default_value=True, tag="_checkbox_loop_record")
-            
-            with dpg.group(horizontal=True):
-                def callback_play(sender, app_data):
-                    # If no keyframes, automatically create keyframes
-                    if len(self.keyframes) == 0:
-                        try:
-                            # Directly call auto_play feature
-                            callback_auto_play(None, None)
-                            return
-                        except Exception as e:
-                            print(f"Failed to automatically create keyframes: {e}")
-                            return
-                            
-                    # If timeline is empty, cannot play
-                    if self.num_record_timeline <= 0:
-                        print("Warning: Cannot play, please add valid keyframes")
-                        return
-                        
-                    self.playing = not self.playing
-                    self.need_update = True
-                    
-                    # Sync audio playback status
-                    if self.playing and self.audio_data is not None and not self.audio_playing:
-                        self.start_audio()
-                    elif not self.playing and self.audio_playing:
-                        self.stop_audio()
-                dpg.add_button(label="play", tag="_button_play", callback=callback_play)
-
-                def callback_export_trajectory(sender, app_data):
-                    self.export_trajectory()
-                dpg.add_button(label="export traj", tag="_button_export_traj", callback=callback_export_trajectory)
-            
-            def callback_save_image(sender, app_data):
-                if not self.cfg.save_folder.exists():
-                    self.cfg.save_folder.mkdir(parents=True)
-                path = self.cfg.save_folder / f"{time.strftime('%Y-%m-%d_%H-%M-%S')}_{self.timestep}.png"
-                print(f"Saving image to {path}")
-                Image.fromarray((np.clip(self.render_buffer, 0, 1) * 255).astype(np.uint8)).save(path)
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="save image", tag="_button_save_image", callback=callback_save_image)
-        
-        # window: FLAME ==================================================================================================
-        if self.gaussians.binding is not None:
-            with dpg.window(label="FLAME parameters", tag="_flame_window", autosize=True, pos=(self.W-300, 0)):
-                def callback_enable_control(sender, app_data):
-                    if app_data:
-                        self.gaussians.update_mesh_by_param_dict(self.flame_param)
-                    else:
-                        self.gaussians.select_mesh_by_timestep(self.timestep)
-                    self.need_update = True
-                dpg.add_checkbox(label="enable control", default_value=False, tag="_checkbox_enable_control", callback=callback_enable_control)
-
-                dpg.add_separator()
-
-                def callback_set_pose(sender, app_data):
-                    joint, axis = sender.split('-')[1:3]
-                    axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis]
-                    self.flame_param[joint][0, axis_idx] = app_data
-                    if joint == 'eyes':
-                        self.flame_param[joint][0, 3+axis_idx] = app_data
-                    if not dpg.get_value("_checkbox_enable_control"):
-                        dpg.set_value("_checkbox_enable_control", True)
-                    self.gaussians.update_mesh_by_param_dict(self.flame_param)
-                    self.need_update = True
-                dpg.add_text(f'Joints')
-                self.pose_sliders = []
-                max_rot = 0.5
-                for joint in ['neck', 'jaw', 'eyes']:
-                    if joint in self.flame_param:
-                        with dpg.group(horizontal=True):
-                            dpg.add_slider_float(min_value=-max_rot, max_value=max_rot, format="%.2f", default_value=self.flame_param[joint][0, 0], callback=callback_set_pose, tag=f"_slider-{joint}-x", width=70)
-                            dpg.add_slider_float(min_value=-max_rot, max_value=max_rot, format="%.2f", default_value=self.flame_param[joint][0, 1], callback=callback_set_pose, tag=f"_slider-{joint}-y", width=70)
-                            dpg.add_slider_float(min_value=-max_rot, max_value=max_rot, format="%.2f", default_value=self.flame_param[joint][0, 2], callback=callback_set_pose, tag=f"_slider-{joint}-z", width=70)
-                            self.pose_sliders.append(f"_slider-{joint}-x")
-                            self.pose_sliders.append(f"_slider-{joint}-y")
-                            self.pose_sliders.append(f"_slider-{joint}-z")
-                            dpg.add_text(f'{joint:4s}')
-                dpg.add_text('   roll       pitch      yaw')
-                
-                dpg.add_separator()
-                
-                def callback_set_expr(sender, app_data):
-                    expr_i = int(sender.split('-')[2])
-                    self.flame_param['expr'][0, expr_i] = app_data
-                    if not dpg.get_value("_checkbox_enable_control"):
-                        dpg.set_value("_checkbox_enable_control", True)
-                    self.gaussians.update_mesh_by_param_dict(self.flame_param)
-                    self.need_update = True
-                self.expr_sliders = []
-                dpg.add_text(f'Expressions')
-                for i in range(5):
-                    dpg.add_slider_float(label=f"{i}", min_value=-3, max_value=3, format="%.2f", default_value=0, callback=callback_set_expr, tag=f"_slider-expr-{i}", width=250)
-                    self.expr_sliders.append(f"_slider-expr-{i}")
-
-                def callback_reset_flame(sender, app_data):
-                    self.reset_flame_param()
-                    if not dpg.get_value("_checkbox_enable_control"):
-                        dpg.set_value("_checkbox_enable_control", True)
-                    self.gaussians.update_mesh_by_param_dict(self.flame_param)
-                    self.need_update = True
-                    for slider in self.pose_sliders + self.expr_sliders:
-                        dpg.set_value(slider, 0)
-                dpg.add_button(label="reset FLAME", tag="_button_reset_flame", callback=callback_reset_flame)
-                
-                dpg.add_separator()
-                
-                # Add API feature to get FLAME parameters
-                dpg.add_text("Get FLAME parameters from API")
-                
-                with dpg.group(horizontal=True):
-                    dpg.add_input_text(label="Character ID", default_value="M003", tag="_input_subject_style", width=100)
-                    dpg.add_combo(
-                        ["neutral", "happy", "sad", "surprise", "fear", "disgust", "anger", "contempt"], 
-                        label="Emotion type", 
-                        default_value="neutral", 
-                        tag="_combo_emotion", 
-                        width=100
-                    )
-                
-                with dpg.group(horizontal=True):
-                    dpg.add_slider_int(label="Emotion intensity", min_value=0, max_value=2, default_value=2, tag="_slider_intensity", width=100)
-                    
                     def callback_get_flame_from_api(sender, app_data):
-                        subject_style = dpg.get_value("_input_subject_style")
-                        emotion = dpg.get_value("_combo_emotion")
-                        intensity = dpg.get_value("_slider_intensity")
-                        
                         if self.cfg.audio_path is None:
-                            print("Please set the audio file path first")
+                            dpg.set_value("_log_status", "Please set audio path first")
                             return
                         
+                        dpg.set_value("_log_status", "Getting FLAME from API...")
                         success = self.get_flame_params_from_api(
                             str(self.cfg.audio_path), 
-                            subject_style=subject_style,
-                            emotion=emotion,
-                            intensity=intensity
+                            subject_style="M003",
+                            emotion="neutral",
+                            intensity=2
                         )
                         
                         if success:
-                            # Enable control
-                            dpg.set_value("_checkbox_enable_control", True)
-                            # Update UI
-                            self.need_update = True
-                            
-                            # Reset to start
-                            dpg.set_value("_slider_record_timestep", 0)
-                            if hasattr(self, 'audio_frame_index'):
-                                self.audio_frame_index = 0
-                                
-                            # Stop current playback if any
-                            if self.audio_playing:
-                                self.stop_audio()
-                                
-                            # Start audio playback
-                            self.start_audio()
-                            
-                            # Auto start rendering animation
+                            # 重置到起点
+                            dpg.set_value("_slider_timestep", 0)
+                            # 启动音频播放
                             self.playing = True
+                            dpg.set_item_label("_button_play_pause", "Pause")
+                            self.start_audio()
+                    
+                    dpg.add_button(label="Generate Animation from Audio", callback=callback_get_flame_from_api)
 
-        # widget-dependent handlers ========================================================================================
+                # 添加文本输入和TTS功能
+                with dpg.collapsing_header(label="TTS", default_open=True):
+                    with dpg.group(width=400):
+                        # 文本输入区域
+                        dpg.add_text("Please input the text:")
+                        dpg.add_input_text(
+                            tag="_input_tts_text",
+                            default_value="我们一起努力加油！",
+                            multiline=True,
+                            width=370,
+                            height=80
+                        )
+                        
+                        with dpg.group(horizontal=True):
+                            # 文本转语音按钮
+                            def callback_text_to_speech(sender, app_data):
+                                # 获取输入文本
+                                text = dpg.get_value("_input_tts_text")
+                                if not text:
+                                    dpg.set_value("_log_status", "Please input the text")
+                                    return
+                                    
+                                # 处理文本到语音，然后生成动画
+                                self.process_text_to_speech_and_animate(text)
+                                
+                            dpg.add_button(
+                                label="Generate TTS", 
+                                tag="_button_generate_tts",
+                                callback=callback_text_to_speech
+                            )
+                            
+                            # PulseAudio播放设置
+                            def callback_toggle_pulseaudio(sender, app_data):
+                                self.cfg.use_pulseaudio = app_data
+                                
+                            dpg.add_checkbox(
+                                label="Use PulseAudio", 
+                                default_value=self.cfg.use_pulseaudio,
+                                callback=callback_toggle_pulseaudio
+                            )
+                            
+                        # 添加服务器设置
+                        with dpg.collapsing_header(label="Server Settings", default_open=False):
+                            with dpg.group(width=400):
+                                # TTS API URL
+                                def callback_set_tts_api_url(sender, app_data):
+                                    self.cfg.tts_api_url = app_data
+                                
+                                dpg.add_input_text(
+                                    label="TTS API URL",
+                                    default_value=self.cfg.tts_api_url,
+                                    callback=callback_set_tts_api_url,
+                                    width=370
+                                )
+                                
+                                # PulseAudio服务器
+                                def callback_set_pulse_server(sender, app_data):
+                                    self.cfg.pulseaudio_server = app_data
+                                    # 更新环境变量
+                                    os.environ["PULSE_SERVER"] = app_data
+                                
+                                dpg.add_input_text(
+                                    label="PulseAudio Server",
+                                    default_value=self.cfg.pulseaudio_server,
+                                    callback=callback_set_pulse_server,
+                                    width=370
+                                )
+
+        # 键盘快捷键
         with dpg.handler_registry():
             dpg.add_key_press_handler(dpg.mvKey_Left, callback=callback_set_current_frame, tag='_mvKey_Left')
             dpg.add_key_press_handler(dpg.mvKey_Right, callback=callback_set_current_frame, tag='_mvKey_Right')
             dpg.add_key_press_handler(dpg.mvKey_Home, callback=callback_set_current_frame, tag='_mvKey_Home')
             dpg.add_key_press_handler(dpg.mvKey_End, callback=callback_set_current_frame, tag='_mvKey_End')
+            
+            # 添加Escape键处理 - 中止渲染
+            def callback_abort_key(sender, app_data):
+                self.abort_render = True
+                dpg.set_value("_log_status", "Aborting render (ESC)...")
+            dpg.add_key_press_handler(dpg.mvKey_Escape, callback=callback_abort_key)
 
             def callbackmouse_wheel_slider(sender, app_data):
                 delta = app_data
                 if dpg.is_item_hovered("_slider_timestep"):
-                    self.timestep = min(max(self.timestep - delta, 0), self.num_timesteps - 1)
-                    dpg.set_value("_slider_timestep", self.timestep)
-                    self.gaussians.select_mesh_by_timestep(self.timestep)
+                    self.next_frame = min(max(self.timestep - delta, 0), self.num_timesteps - 1)
+                    dpg.set_value("_slider_timestep", self.next_frame)
+                    dpg.set_value("_log_current_frame", f"{self.next_frame}")
+                    self.need_frame_update = True
                     self.need_update = True
             dpg.add_mouse_wheel_handler(callback=callbackmouse_wheel_slider)
 
@@ -1635,149 +1398,187 @@ class LocalViewer(Mini3DViewer):
 
     def update_audio_display(self):
         """更新界面上的音频位置显示"""
-        if not self.audio_playing or self.audio_data is None:
+        if not self.audio_playing or self.audio_data is None or self.sample_rate is None:
             return
             
-        # 获取当前播放帧位置
-        current_frame = dpg.get_value("_slider_record_timestep")
-        audio_position = current_frame * self.audio_frame_duration
+        # 获取当前帧的音频位置
+        audio_time = self.timestep / self.cfg.fps
         
         # 更新音频位置显示
         if dpg.does_item_exist("_text_audio_position"):
-            dpg.set_value("_text_audio_position", f"Audio position: {audio_position:.2f}s")
-            
-        # 更新帧数显示
-        if dpg.does_item_exist("_text_frame_position"):
-            # 如果是dynamic模式，使用timestep作为当前帧
-            if dpg.get_value("_checkbox_dynamic_record"):
-                current_npz_frame = self.timestep
-            else:
-                # 非dynamic模式，根据时间线进度估算NPZ帧数
-                if self.num_record_timeline > 1:
-                    # 计算播放进度比例
-                    progress = current_frame / (self.num_record_timeline - 1)
-                    # 根据进度比例计算当前NPZ帧
-                    current_npz_frame = int(progress * (self.num_timesteps - 1))
-                else:
-                    current_npz_frame = 0
-                    
-            dpg.set_value("_text_frame_position", f"Frame: {current_npz_frame} / {self.num_timesteps-1}")
-            
-        # 更新进度条，但不触发回调
-        if dpg.does_item_exist("_slider_audio_position"):
-            # 暂时移除回调函数
-            callback = dpg.get_item_callback("_slider_audio_position")
-            dpg.set_item_callback("_slider_audio_position", None)
-            
-            # 更新值
-            dpg.set_value("_slider_audio_position", audio_position)
-            
-            # 恢复回调函数
-            dpg.set_item_callback("_slider_audio_position", callback)
+            dpg.set_value("_text_audio_position", f"{audio_time:.2f}s")
             
     @torch.no_grad()
-    def run(self):
-        print("Running LocalViewer...")
-        print(f"Configuration:")
-        print(f"- Point cloud path: {self.cfg.point_path}")
-        print(f"- Motion path: {self.cfg.motion_path}")
-        print(f"- Audio path: {self.cfg.audio_path}")
-        print(f"- API URL: {self.cfg.api_url}")
-        print(f"- FPS: {self.cfg.fps}")
-        print(f"- Audio offset: {self.cfg.audio_offset}")
-        print(f"- Auto mode: {self.auto_mode}")
-        
-        if self.gaussians.binding is not None:
-            print(f"FLAME model loaded:")
-            print(f"- Total timesteps: {self.num_timesteps}")
-            print(f"- FLAME parameters:")
-            for k, v in self.gaussians.flame_param.items():
-                print(f"  - {k}: {v.shape}")
-        else:
-            print("FLAME model not loaded")
-        
-        # Frame rate control variables
-        last_frame_time = time.time()
-        target_frame_time = 1.0 / self.cfg.fps if self.cfg.fps > 0 else 0.04  # default 25fps
-
-        while dpg.is_dearpygui_running():
-            current_time = time.time()
-            
-            # 更新音频位置显示
-            self.update_audio_display()
-            
-            if self.need_update or self.playing:
-                # Frame rate lock - Important: This ensures audio and visual sync
-                if self.playing and self.cfg.lock_frame_rate:
-                    elapsed = current_time - last_frame_time
-                    if elapsed < target_frame_time:
-                        time.sleep(target_frame_time - elapsed)
-                        current_time = time.time()
+    def render_frame(self):
+        """渲染线程 - 带超时和中断机制"""
+        while self.thread_running:
+            try:
+                # 处理帧更新请求
+                if self.need_frame_update and not self.is_rendering:
+                    dpg.set_value("_log_status", f"Updating frame to {self.next_frame}")
+                    try:
+                        self.timestep = self.next_frame
+                        # 添加防御性检查
+                        if hasattr(self.gaussians, 'binding') and self.gaussians.binding is not None:
+                            self.gaussians.select_mesh_by_timestep(self.timestep)
+                            dpg.set_value("_log_status", f"Updated to frame {self.timestep}")
+                        else:
+                            dpg.set_value("_log_status", f"Frame {self.timestep} (no FLAME model)")
+                        
+                        dpg.set_value("_log_current_frame", f"{self.timestep}")
+                        # 更新时间线显示
+                        self.update_record_timeline()
+                        self.need_frame_update = False
+                    except Exception as e:
+                        print(f"Error updating frame: {e}")
+                        dpg.set_value("_log_status", f"Error: {str(e)[:20]}...")
+                        self.need_frame_update = False  # 确保错误状态下也清除标志
                 
-                # Render current frame
-                cam = self.prepare_camera()
-
-                if dpg.get_value("_checkbox_show_splatting"):
-                    # rgb
-                    rgb_splatting = render(cam, self.gaussians, self.cfg.pipeline, torch.tensor(self.cfg.background_color).cuda(), scaling_modifier=dpg.get_value("_slider_scaling_modifier"))["render"].permute(1, 2, 0).contiguous()
-
-                if self.gaussians.binding is not None and dpg.get_value("_checkbox_show_mesh"):
-                    out_dict = self.mesh_renderer.render_from_camera(self.gaussians.verts, self.gaussians.faces, cam, face_colors=self.face_colors)
-
-                    rgba_mesh = out_dict['rgba'].squeeze(0)  # (H, W, C)
-                    rgb_mesh = rgba_mesh[:, :, :3]
-                    alpha_mesh = rgba_mesh[:, :, 3:]
-                    mesh_opacity = self.mesh_color[3:].cuda()
-
-                if dpg.get_value("_checkbox_show_splatting") and dpg.get_value("_checkbox_show_mesh"):
-                    rgb = rgb_mesh * alpha_mesh * mesh_opacity  + rgb_splatting * (alpha_mesh * (1 - mesh_opacity) + (1 - alpha_mesh))
-                elif dpg.get_value("_checkbox_show_splatting") and not dpg.get_value("_checkbox_show_mesh"):
-                    rgb = rgb_splatting
-                elif not dpg.get_value("_checkbox_show_splatting") and dpg.get_value("_checkbox_show_mesh"):
-                    rgb = rgb_mesh
+                # 执行渲染
+                if self.need_update and not self.is_rendering:
+                    # 检查是否是已知的复杂帧
+                    if self.should_skip_complex_frames and self.playing and self.timestep in self.complex_frames:
+                        dpg.set_value("_log_status", f"Skipping slow frame {self.timestep}")
+                        self.need_update = False
+                        continue
+                    
+                    # 开始渲染
+                    self.is_rendering = True
+                    self.abort_render = False
+                    
+                    try:
+                        dpg.set_value("_log_status", f"Rendering frame {self.timestep}...")
+                    except:
+                        print("Warning: Failed to update UI status")
+                    
+                    # 记录渲染开始时间
+                    self.render_start_time = time.time()
+                    render_start_time = self.render_start_time
+                    
+                    try:
+                        # 获取渲染参数
+                        show_splatting = dpg.get_value("_checkbox_show_splatting")
+                        show_mesh = dpg.get_value("_checkbox_show_mesh") if self.gaussians.binding is not None else False
+                        scaling_modifier = dpg.get_value("_slider_scaling_modifier")
+                        
+                        # 准备摄像机
+                        cam = self.prepare_camera()
+                        
+                        # 初始化为默认背景
+                        rgb = torch.ones([self.H, self.W, 3])
+                        
+                        # 执行渲染，并检查超时和中断
+                        timeout_occurred = False
+                        
+                        # 渲染高斯点云
+                        if show_splatting and not self.abort_render:
+                            dpg.set_value("_log_status", "Rendering gaussians...")
+                            
+                            # 检查渲染是否超时
+                            if time.time() - render_start_time > self.cfg.render_timeout:
+                                dpg.set_value("_log_status", f"Timeout rendering gaussians on frame {self.timestep}")
+                                timeout_occurred = True
+                            else:
+                                rgb_splatting = render(cam, self.gaussians, self.cfg.pipeline, 
+                                                    torch.tensor(self.cfg.background_color).cuda(), 
+                                                    scaling_modifier=scaling_modifier)["render"].permute(1, 2, 0).contiguous()
+                        
+                        # 渲染网格
+                        if show_mesh and not self.abort_render and not timeout_occurred and self.gaussians.binding is not None:
+                            dpg.set_value("_log_status", "Rendering mesh...")
+                            
+                            # 检查渲染是否超时
+                            if time.time() - render_start_time > self.cfg.render_timeout:
+                                dpg.set_value("_log_status", f"Timeout rendering mesh on frame {self.timestep}")
+                                timeout_occurred = True
+                            else:
+                                out_dict = self.mesh_renderer.render_from_camera(
+                                    self.gaussians.verts, self.gaussians.faces, cam, face_colors=self.face_colors)
+                                
+                                rgba_mesh = out_dict['rgba'].squeeze(0)
+                                rgb_mesh = rgba_mesh[:, :, :3]
+                                alpha_mesh = rgba_mesh[:, :, 3:]
+                                mesh_opacity = self.mesh_color[3:].cuda()
+                        
+                        # 合成最终图像
+                        if not timeout_occurred and not self.abort_render:
+                            if show_splatting and show_mesh:
+                                rgb = rgb_mesh * alpha_mesh * mesh_opacity + rgb_splatting * (alpha_mesh * (1 - mesh_opacity) + (1 - alpha_mesh))
+                            elif show_splatting:
+                                rgb = rgb_splatting
+                            elif show_mesh:
+                                rgb = rgb_mesh
+                        
+                        # 计算渲染时间
+                        render_time = time.time() - render_start_time
+                        
+                        # 记录帧渲染性能
+                        self.frame_times[self.timestep] = render_time * 1000  # 毫秒
+                        
+                        # 标记复杂帧
+                        if render_time * 1000 > self.max_render_time:
+                            self.complex_frames.add(self.timestep)
+                            dpg.set_value("_log_status", f"Frame {self.timestep} is slow: {render_time*1000:.1f}ms")
+                        
+                        # 避免在渲染线程中过多地更新UI状态
+                        status = ""
+                        if not timeout_occurred and not self.abort_render:
+                            render_buffer = rgb.cpu().numpy()
+                            if render_buffer.shape[0] == self.H and render_buffer.shape[1] == self.W:
+                                try:
+                                    # 使用非阻塞方式放入队列
+                                    self.render_queue.put((render_buffer, render_time, self.timestep), 
+                                                        block=False)
+                                    status = "Render complete"
+                                except queue.Full:
+                                    status = "Render queue full, skipping update"
+                            else:
+                                status = f"Invalid render size: {render_buffer.shape}"
+                        elif timeout_occurred:
+                            status = f"Render timeout on frame {self.timestep}"
+                        else:
+                            status = f"Render aborted on frame {self.timestep}"
+                        
+                        try:
+                            dpg.set_value("_log_status", status)
+                        except:
+                            print(f"Warning: Failed to update UI status: {status}")
+                        
+                    except Exception as e:
+                        print(f"Render task error: {traceback.format_exc()}")
+                        try:
+                            dpg.set_value("_log_status", f"Render error: {str(e)[:20]}...")
+                        except:
+                            print(f"Warning: Failed to update UI with error: {str(e)[:20]}")
+                    
+                    # 确保无论如何都重置状态
+                    self.need_update = False
+                    self.is_rendering = False
+                    self.abort_render = False
                 else:
-                    rgb = torch.ones([self.H, self.W, 3])
-
-                self.render_buffer = rgb.cpu().numpy()
-                if self.render_buffer.shape[0] != self.H or self.render_buffer.shape[1] != self.W:
-                    continue
-                dpg.set_value("_texture", self.render_buffer)
-
-                self.refresh_stat()
+                    # 没有渲染任务，短暂休眠
+                    time.sleep(0.01)
+            
+            except Exception as e:
+                print(f"Render thread error: {traceback.format_exc()}")
+                try:
+                    dpg.set_value("_log_status", f"Thread error: {str(e)[:20]}...")
+                except:
+                    print(f"Warning: Failed to update UI with thread error")
+                self.is_rendering = False
                 self.need_update = False
-                last_frame_time = current_time
-
-                if self.playing:
-                    record_timestep = dpg.get_value("_slider_record_timestep")
-                    next_timestep = record_timestep + 1
-                    
-                    # Check if reached the end
-                    if next_timestep >= self.num_record_timeline - 1:
-                        if not dpg.get_value("_checkbox_loop_record"):
-                            self.playing = False
-                            if self.audio_playing:
-                                self.stop_audio()
-                        next_timestep = 0
-                    
-                    # Update timeline
-                    dpg.set_value("_slider_record_timestep", next_timestep)
-                    
-                    # Update audio frame index - Important: This keeps audio and visual in sync
-                    if self.audio_playing:
-                        self.audio_frame_index = next_timestep
-                    
-                    # Update dynamic timestep
-                    if dpg.get_value("_checkbox_dynamic_record"):
-                        self.timestep = min(self.timestep + 1, self.num_timesteps - 1)
-                        dpg.set_value("_slider_timestep", self.timestep)
-                        self.gaussians.select_mesh_by_timestep(self.timestep)
-
-                    # 只有在锁定摄像机时才应用关键帧中的摄像机状态
-                    if dpg.does_item_exist("_checkbox_lock_camera") and dpg.get_value("_checkbox_lock_camera"):
-                        state_dict = self.get_state_dict_record()
-                        self.apply_state_dict(state_dict)
-
-            dpg.render_dearpygui_frame()
+                time.sleep(0.1)
+                
+            # 检查渲染是否运行超时
+            if self.is_rendering and (time.time() - self.render_start_time > self.cfg.render_timeout + 1.0):
+                print(f"Render timeout detected for frame {self.timestep}")
+                try:
+                    dpg.set_value("_log_status", f"Timeout forced abort for frame {self.timestep}")
+                except:
+                    print("Warning: Failed to update UI status for timeout")
+                self.is_rendering = False
+                self.need_update = False
+                time.sleep(0.1)
 
     def check_audio_devices(self):
         """检测系统中可用的音频设备并输出诊断信息"""
@@ -1833,6 +1634,479 @@ class LocalViewer(Mini3DViewer):
             
         print("========================")
 
+    def signal_handler(self, sig, frame):
+        """处理Ctrl+C，安全关闭程序"""
+        print("Exiting safely...")
+        self.thread_running = False
+        self.stop_audio()
+        sys.exit(0)
+
+    @torch.no_grad()
+    def run(self):
+        print("Running Audio Local Viewer...")
+        print(f"Configuration:")
+        print(f"- Point cloud path: {self.cfg.point_path}")
+        print(f"- Motion path: {self.cfg.motion_path}")
+        print(f"- Audio path: {self.cfg.audio_path}")
+        print(f"- API URL: {self.cfg.api_url}")
+        print(f"- FPS: {self.cfg.fps}")
+        # print(f"- Audio offset: {self.cfg.audio_offset}")
+        print(f"- Auto mode: {self.auto_mode}")
+        
+        if self.gaussians.binding is not None:
+            print(f"FLAME model loaded:")
+            print(f"- Total timesteps: {self.num_timesteps}")
+            print(f"- FLAME parameters:")
+            for k, v in self.gaussians.flame_param.items():
+                print(f"  - {k}: {v.shape}")
+        else:
+            print("FLAME model not loaded - will use basic rendering mode")
+            # Initialize a default number of timesteps if not set
+            if not hasattr(self, 'num_timesteps') or self.num_timesteps is None:
+                self.num_timesteps = 100  # Default value
+                print(f"- Using default timesteps: {self.num_timesteps}")
+                dpg.configure_item("_slider_timestep", max_value=self.num_timesteps - 1)
+        
+        # Initialize audio status
+        if self.audio_data is not None and self.sample_rate is not None:
+            print(f"Audio loaded: {self.audio_data.shape}, sample rate: {self.sample_rate}Hz")
+        else:
+            print("No audio loaded or invalid audio data")
+            
+        # 初始化播放相关变量
+        self.playback_speed = 1.0
+        self.last_frame_time = time.time()
+        self.ui_update_time = time.time()
+        
+        # 性能分析变量
+        timing_stats = {
+            "ui_render": 0.0,
+            "queue_process": 0.0,
+            "playback_logic": 0.0,
+            "audio_update": 0.0,
+            "total_frame": 0.0,
+            "idle": 0.0
+        }
+        timing_counts = {k: 0 for k in timing_stats}
+        last_stats_time = time.time()
+        
+        try:
+            dpg.set_value("_log_current_frame", f"{self.timestep}")
+        except:
+            print("Warning: Failed to initialize UI frame number")
+            
+        # 添加状态显示
+        if not dpg.does_item_exist("_log_status"):
+            with dpg.group(parent="_render_window", horizontal=True):
+                dpg.add_text("Status:")
+                dpg.add_text("Ready", tag="_log_status")
+        
+        # 添加渲染时间显示
+        if not dpg.does_item_exist("_log_render_time"):
+            with dpg.group(parent="_render_window", horizontal=True):
+                dpg.add_text("Render time:")
+                dpg.add_text("0.0ms", tag="_log_render_time")
+
+        # 启动渲染线程
+        if self.render_thread is None or not self.render_thread.is_alive():
+            self.render_thread = threading.Thread(target=self.render_frame)
+            self.render_thread.daemon = True
+            self.render_thread.start()
+        
+        # 主循环
+        ui_freeze_count = 0
+        last_ui_time = time.time()
+        
+        while dpg.is_dearpygui_running():
+            frame_start = time.time()
+            current_time = frame_start
+            
+            # 监测UI响应
+            if current_time - last_ui_time > 1.0:
+                ui_freeze_count += 1
+                print(f"Possible UI freeze detected: {ui_freeze_count}")
+                if ui_freeze_count > 5:
+                    print("UI appears frozen, forcing state reset")
+                    self.is_rendering = False
+                    self.need_update = False
+                    self.need_frame_update = False
+                    self.abort_render = True
+                    ui_freeze_count = 0
+            else:
+                ui_freeze_count = 0
+            last_ui_time = current_time
+            
+            # 处理渲染队列
+            queue_start = time.time()
+            latest_render = None
+            try:
+                while True:
+                    render_data = self.render_queue.get(block=False)
+                    latest_render = render_data
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print(f"Error clearing queue: {e}")
+            
+            # 更新渲染结果
+            if latest_render is not None:
+                try:
+                    if isinstance(latest_render, tuple) and len(latest_render) >= 2:
+                        render_buffer, render_time = latest_render[0], latest_render[1]
+                        self.render_buffer = render_buffer
+                        self.render_time = render_time
+                        
+                        # 更新UI
+                        dpg.set_value("_texture", self.render_buffer)
+                        dpg.set_value("_log_render_time", f'{render_time*1000:.1f}ms')
+                        self.refresh_stat()
+                        self.ui_update_time = current_time
+                except Exception as e:
+                    print(f"UI update error: {e}")
+            
+            queue_end = time.time()
+            timing_stats["queue_process"] += (queue_end - queue_start)
+            timing_counts["queue_process"] += 1
+            
+            # 更新音频相关UI
+            audio_start = time.time()
+            self.update_audio_display()
+            audio_end = time.time()
+            timing_stats["audio_update"] += (audio_end - audio_start)
+            timing_counts["audio_update"] += 1
+            
+            # 处理播放逻辑
+            playback_start = time.time()
+            if self.playing and not self.is_rendering and not self.need_frame_update and not self.need_update:
+                speed = getattr(self, 'playback_speed', 1.0)
+                fps_target = self.cfg.fps * speed
+                time_since_last_frame = current_time - self.last_frame_time
+                
+                # 检查是否应该播放下一帧
+                if time_since_last_frame >= 1.0 / fps_target:
+                    self.last_frame_time = current_time
+                    
+                    # 计算下一帧
+                    next_frame = self.timestep + 1
+                    
+                    # 如果启用跳帧，尝试找到下一个非复杂帧
+                    if self.should_skip_complex_frames:
+                        skip_count = 0
+                        while next_frame in self.complex_frames and skip_count < 10 and next_frame < self.num_timesteps - 1:
+                            next_frame += 1
+                            skip_count += 1
+                        if skip_count > 0:
+                            try:
+                                dpg.set_value("_log_status", f"Skipped {skip_count} slow frames")
+                            except:
+                                pass
+                    
+                    # 处理循环逻辑
+                    if next_frame >= self.num_timesteps:
+                        if dpg.get_value("_checkbox_loop"):
+                            next_frame = 0
+                        else:
+                            self.playing = False
+                            try:
+                                dpg.set_item_label("_button_play_pause", "Play")
+                                dpg.set_value("_log_status", "Playback complete")
+                                # 如果音频正在播放，停止音频
+                                if self.audio_playing:
+                                    self.stop_audio()
+                            except:
+                                print("Warning: Failed to update playback controls")
+                            continue
+                    
+                    # 设置下一帧
+                    self.next_frame = next_frame
+                    try:
+                        dpg.set_value("_slider_timestep", self.next_frame)
+                        dpg.set_value("_log_current_frame", f"{self.next_frame}")
+                    except:
+                        print(f"Warning: Failed to update UI with frame {self.next_frame}")
+                    
+                    self.need_frame_update = True
+                    self.need_update = True
+            
+            playback_end = time.time()
+            timing_stats["playback_logic"] += (playback_end - playback_start)
+            timing_counts["playback_logic"] += 1
+            
+            # 检测潜在的死锁
+            if self.is_rendering and (current_time - self.render_start_time > 10.0):
+                print(f"检测到潜在死锁，强制重置状态")
+                self.is_rendering = False
+                self.need_update = False
+                self.need_frame_update = False
+                self.abort_render = True
+            
+            # 渲染UI
+            ui_start = time.time()
+            try:
+                dpg.render_dearpygui_frame()
+            except Exception as e:
+                print(f"渲染UI帧错误: {e}")
+                self.is_rendering = False
+                self.need_update = False
+                self.need_frame_update = False
+                time.sleep(0.1)
+            
+            ui_end = time.time()
+            timing_stats["ui_render"] += (ui_end - ui_start)
+            timing_counts["ui_render"] += 1
+            
+            # 空闲时间
+            idle_start = time.time()
+            time.sleep(0.005)  # 减轻CPU负担
+            idle_end = time.time()
+            
+            timing_stats["idle"] += (idle_end - idle_start)
+            timing_counts["idle"] += 1
+            
+            frame_end = time.time()
+            timing_stats["total_frame"] += (frame_end - frame_start)
+            timing_counts["total_frame"] += 1
+            
+            # 性能统计
+            if time.time() - last_stats_time > 5.0 and all(v > 0 for v in timing_counts.values()):
+                avg_stats = {k: (timing_stats[k] * 1000 / timing_counts[k]) for k in timing_stats}
+                total_time_per_frame = avg_stats["total_frame"]
+                effective_fps = 1000 / total_time_per_frame if total_time_per_frame > 0 else 0
+                
+                print("\n--- 性能统计 (毫秒) ---")
+                print(f"队列处理:     {avg_stats['queue_process']:.2f} ms")
+                print(f"音频更新:     {avg_stats['audio_update']:.2f} ms")
+                print(f"播放逻辑:     {avg_stats['playback_logic']:.2f} ms")
+                print(f"UI渲染:       {avg_stats['ui_render']:.2f} ms")
+                print(f"空闲时间:     {avg_stats['idle']:.2f} ms")
+                print(f"总帧时间:     {avg_stats['total_frame']:.2f} ms")
+                print(f"有效FPS:      {effective_fps:.2f}")
+                print(f"渲染线程FPS:  {1000 / (self.render_time*1000) if self.render_time else 0:.2f}")
+                
+                # 重置计数器
+                timing_stats = {k: 0.0 for k in timing_stats}
+                timing_counts = {k: 0 for k in timing_counts}
+                last_stats_time = time.time()
+
+        # 清理
+        print("关闭渲染线程...")
+        self.thread_running = False
+        self.stop_audio()
+        if self.render_thread:
+            timeout = 2.0
+            self.render_thread.join(timeout=timeout)
+            if self.render_thread.is_alive():
+                print("警告: 渲染线程未正常终止")
+
+    def setup_pulseaudio_env(self):
+        """设置PulseAudio环境变量"""
+        import os
+        import subprocess
+        
+        print("Setting up PulseAudio environment...")
+        
+        # 始终设置PulseAudio服务器环境变量
+        os.environ["PULSE_SERVER"] = self.cfg.pulseaudio_server
+        print(f"PULSE_SERVER set to: {os.environ['PULSE_SERVER']}")
+        
+        # 尝试列出可用的PulseAudio设备
+        try:
+            print("Trying to list PulseAudio sinks...")
+            result = subprocess.run(
+                ["pactl", f"--server={os.environ['PULSE_SERVER']}", "list", "short", "sinks"],
+                capture_output=True, 
+                text=True, 
+                timeout=5
+            )
+            
+            if result.returncode == 0:
+                print("Available PulseAudio sinks:")
+                print(result.stdout)
+                
+                # 查找waveout设备
+                lines = result.stdout.strip().split('\n')
+                for line in lines:
+                    if line and 'waveout' in line:
+                        parts = line.split('\t')[0]
+                        try:
+                            sink_id = int(parts)
+                            print(f"Found waveout sink with ID: {sink_id}")
+                            self.pulse_sink_id = sink_id
+                            return sink_id
+                        except:
+                            print(f"Could not parse sink ID from: {parts}")
+            else:
+                print(f"pactl command failed with error: {result.stderr}")
+        except Exception as e:
+            print(f"Error running pactl: {e}")
+        
+        # 默认返回0
+        self.pulse_sink_id = 0
+        return 0
+
+    def play_audio_with_pulseaudio(self, audio_path):
+        """使用PulseAudio播放音频文件
+        
+        Args:
+            audio_path (str): 音频文件路径
+        """
+        try:
+            print(f"使用PulseAudio播放音频: {audio_path}")
+            pulse_server = os.environ.get("PULSE_SERVER", self.cfg.pulseaudio_server)
+            
+            cmd = ["paplay", f"--server={pulse_server}", str(audio_path)]
+            print(f"执行命令: {' '.join(cmd)}")
+            
+            process = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE
+            )
+            
+            # 非阻塞方式获取输出
+            def monitor_process():
+                stdout, stderr = process.communicate()
+                if process.returncode != 0:
+                    print(f"PulseAudio播放错误: {stderr.decode('utf-8', errors='ignore')}")
+                else:
+                    print("PulseAudio播放完成")
+                    
+            monitor_thread = threading.Thread(target=monitor_process)
+            monitor_thread.daemon = True
+            monitor_thread.start()
+            
+            return True
+        except Exception as e:
+            print(f"使用PulseAudio播放音频时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def get_tts_from_api(self, text):
+        """从API获取TTS音频
+        
+        Args:
+            text (str): 需要转换为语音的文本
+            
+        Returns:
+            bool: 是否成功获取并保存音频
+        """
+        try:
+            print(f"从API获取TTS音频，文本: {text}")
+            
+            # 确保目录存在
+            os.makedirs(os.path.dirname(self.cfg.temp_audio_path) if os.path.dirname(self.cfg.temp_audio_path) else ".", exist_ok=True)
+            
+            # 准备API请求
+            api_url = f"{self.cfg.tts_api_url}/api/tts"
+            print(f"请求URL: {api_url}")
+            
+            # 使用multipart/form-data格式发送请求
+            files = {'target_text': (None, text)}
+            
+            # 发送请求
+            print("发送TTS请求...")
+            response = requests.post(api_url, files=files, stream=True, timeout=30)
+            
+            if response.status_code != 200:
+                print(f"TTS API请求失败: 状态码 {response.status_code}")
+                print(f"错误信息: {response.text}")
+                return False
+                
+            # 保存音频文件
+            audio_path = self.cfg.temp_audio_path
+            print(f"保存TTS音频到: {audio_path}")
+            
+            with open(audio_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            print(f"TTS音频保存成功: {audio_path}")
+            
+            # 更新当前音频路径
+            self.cfg.audio_path = audio_path
+            
+            # 加载音频
+            self.load_audio()
+            
+            # 返回成功
+            return True
+            
+        except Exception as e:
+            print(f"获取TTS音频时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+            
+    def process_text_to_speech_and_animate(self, text):
+        """处理文本到语音，然后生成FLAME动画
+        
+        Args:
+            text (str): 需要转换为语音的文本
+            
+        Returns:
+            bool: 是否成功完成整个流程
+        """
+        try:
+            # 显示处理状态
+            dpg.set_value("_log_status", f"正在处理文本: {text}")
+            
+            # 第一步：从API获取TTS音频
+            print("步骤1: 获取TTS音频...")
+            tts_success = self.get_tts_from_api(text)
+            
+            if not tts_success:
+                dpg.set_value("_log_status", "获取TTS音频失败")
+                return False
+            
+            # 第二步：将音频文件路径保存到服务器
+            print("步骤2: 准备音频文件路径...")
+            audio_path = str(self.cfg.audio_path.absolute())
+            print(f"音频文件路径: {audio_path}")
+            
+            # 第三步：从API获取FLAME参数
+            print("步骤3: 获取FLAME参数...")
+            dpg.set_value("_log_status", "正在获取FLAME参数...")
+            
+            # 如果设置了server_audio_path，优先使用它
+            target_audio_path = self.cfg.server_audio_path if self.cfg.server_audio_path else audio_path
+            
+            flame_success = self.get_flame_params_from_api(
+                target_audio_path,
+                subject_style="M003", 
+                emotion="neutral",
+                intensity=2
+            )
+            
+            if not flame_success:
+                dpg.set_value("_log_status", "获取FLAME参数失败")
+                return False
+                
+            # 第四步：使用PulseAudio播放音频（如果启用）
+            if self.cfg.use_pulseaudio:
+                print("步骤4: 使用PulseAudio播放音频...")
+                self.play_audio_with_pulseaudio(audio_path)
+            
+            # 重置到起点并开始播放
+            dpg.set_value("_slider_timestep", 0)
+            self.playing = True
+            dpg.set_item_label("_button_play_pause", "Pause")
+            
+            if not self.cfg.use_pulseaudio:
+                # 使用内置方法播放音频
+                self.start_audio()
+            
+            dpg.set_value("_log_status", "处理完成，开始播放")
+            return True
+            
+        except Exception as e:
+            print(f"文本到语音动画处理出错: {e}")
+            import traceback
+            traceback.print_exc()
+            dpg.set_value("_log_status", f"处理错误: {str(e)[:30]}...")
+            return False
+
 
 if __name__ == "__main__":
     # 尝试初始化声卡系统
@@ -1887,76 +2161,94 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"获取默认设备信息失败: {e}")
     
-    cfg = tyro.cli(Config)
-    
-    # If test_api is set, test API connection first
-    if cfg.test_api:
-        print("Testing API connection...")
-        try:
-            api_url = cfg.api_url
-            health_check = requests.get(f"{api_url}/health", timeout=2)
-            if health_check.status_code == 200:
-                print(f"API service is normal: {health_check.text}")
+    try:
+        # 添加额外的命令行参数说明
+        parser_help = """
+GaussianAvatars - Audio Local Viewer
+
+主要功能:
+- 从音频生成FLAME面部动画
+- 支持文本到语音转换
+- 使用PulseAudio实现远程音频播放
+
+PulseAudio设置:
+  --pulseaudio_server PULSEAUDIO_SERVER   PulseAudio服务器地址 (默认: 100.127.107.62:4713)
+  --use_pulseaudio / --no-use_pulseaudio  是否使用PulseAudio (默认: 使用)
+
+API设置:
+  --api_url API_URL                       FLAME API服务器URL (默认: http://localhost:5001)
+  --tts_api_url TTS_API_URL               TTS API服务器URL (默认: http://10.112.208.173:5001)
+  --test_api                              启动时测试API连接
+  
+音频设置:
+  --audio_path AUDIO_PATH                 本地音频文件路径
+  --server_audio_path SERVER_AUDIO_PATH   服务器上的音频文件路径
+  --audio_offset AUDIO_OFFSET             音频偏移量(秒)
+
+示例:
+  python audio_local_viewer.py --point_path=avatar.ply --motion_path=motion.npz
+  python audio_local_viewer.py --tts_api_url=http://10.112.208.173:5001 --pulseaudio_server=100.127.107.62:4713
+"""
+        
+        # 解析命令行参数
+        cfg = tyro.cli(Config, description=parser_help)
+        
+        print("\n=== 配置信息 ===")
+        print(f"- 点云路径: {cfg.point_path}")
+        print(f"- 动作路径: {cfg.motion_path}")
+        print(f"- 音频路径: {cfg.audio_path}")
+        print(f"- FLAME API URL: {cfg.api_url}")
+        print(f"- TTS API URL: {cfg.tts_api_url}")
+        print(f"- PulseAudio服务器: {cfg.pulseaudio_server}")
+        print(f"- 使用PulseAudio: {cfg.use_pulseaudio}")
+        print(f"- 服务器音频路径: {cfg.server_audio_path}")
+        print(f"- 临时音频路径: {cfg.temp_audio_path}")
+        print("================\n")
+        
+        # 检查必要参数
+        if cfg.point_path is None:
+            print("警告: 未指定点云路径 (--point_path)，可能会影响渲染功能")
+            
+        # 设置PulseAudio环境变量
+        if cfg.use_pulseaudio:
+            os.environ["PULSE_SERVER"] = cfg.pulseaudio_server
+            print(f"已设置PULSE_SERVER环境变量为: {cfg.pulseaudio_server}")
+        
+        # 测试API连接
+        if cfg.test_api:
+            print("正在测试API连接...")
+            try:
+                # 测试FLAME API
+                flame_api_url = cfg.api_url
+                print(f"测试FLAME API: {flame_api_url}")
+                try:
+                    health_check = requests.get(f"{flame_api_url}/health", timeout=2)
+                    if health_check.status_code == 200:
+                        print(f"FLAME API服务正常: {health_check.text}")
+                    else:
+                        print(f"FLAME API服务状态异常: 状态码 {health_check.status_code}")
+                except Exception as e:
+                    print(f"FLAME API连接失败: {e}")
                 
-                # Try to directly generate FLAME parameters using API
-                audio_path = None
-                
-                # Prioritize using server_audio_path parameter
-                if cfg.server_audio_path:
-                    audio_path = cfg.server_audio_path
-                    print(f"Using audio path on server: {audio_path}")
-                # Otherwise, try using audio_path parameter
-                elif cfg.audio_path:
-                    audio_path = str(cfg.audio_path)
-                    if not os.path.isabs(audio_path):
-                        abs_audio_path = os.path.abspath(audio_path)
-                        print(f"Converting local path to absolute path: {abs_audio_path}")
-                        audio_path = abs_audio_path
-                    print(f"Using local audio path: {audio_path}")
-                    print("Warning: Server may not be able to access this local path, consider using --server_audio_path parameter")
-                
-                if audio_path:
-                    # Construct request
-                    flame_api_url = f"{api_url}/api/flame_from_path"
-                    payload = {
-                        "audio_path": audio_path,
-                        "subject_style": "M003",
-                        "emotion": "neutral",
-                        "intensity": 2
-                    }
-                    
-                    print(f"Sending request to {flame_api_url}")
-                    print(f"Request data: {payload}")
-                    
-                    try:
-                        response = requests.post(flame_api_url, json=payload, timeout=30)
-                        if response.status_code == 200:
-                            print("API request successful!")
-                            try:
-                                result = response.json()
-                                print(f"Returned data contains the following keys: {list(result.keys())}")
-                                print(f"Returned metadata: {result.get('metadata', {})}")
-                                if 'expression' in result:
-                                    print(f"Expression parameters shape: {np.array(result['expression']).shape}")
-                                if 'jaw_pose' in result:
-                                    print(f"Jaw parameters shape: {np.array(result['jaw_pose']).shape}")
-                            except:
-                                print("Unable to parse returned JSON data")
-                        else:
-                            print(f"API request failed: status code {response.status_code}")
-                            print(f"Error message: {response.text}")
-                    except Exception as e:
-                        print(f"Error occurred during request: {e}")
-                else:
-                    print("No audio path specified, skipping API request test")
-                    print("Please use --server_audio_path parameter to specify audio path on server")
-                    print("For example: --server_audio_path=/home/plm/inferno/assets/data/EMOTE_test_example_data/02_that.wav")
-            else:
-                print(f"API service status abnormal: status code {health_check.status_code}")
-                print("Program will continue but API features may not be available")
-        except Exception as e:
-            print(f"API connection test failed: {e}")
-            print("Program will continue but API features may not be available")
-    
-    gui = LocalViewer(cfg)
-    gui.run()
+                # 测试TTS API
+                tts_api_url = cfg.tts_api_url
+                print(f"测试TTS API: {tts_api_url}")
+                try:
+                    # 简单发送HEAD请求测试连接
+                    head_check = requests.head(f"{tts_api_url}/api/tts", timeout=2)
+                    if head_check.status_code in [200, 405]:  # 405是Method Not Allowed，但说明服务存在
+                        print(f"TTS API服务正常: 状态码 {head_check.status_code}")
+                    else:
+                        print(f"TTS API服务状态异常: 状态码 {head_check.status_code}")
+                except Exception as e:
+                    print(f"TTS API连接失败: {e}")
+            except Exception as e:
+                print(f"API测试过程中出错: {e}")
+        
+        # 创建并运行查看器
+        gui = LocalViewer(cfg)
+        gui.run()
+    except Exception as e:
+        print(f"程序初始化时出错: {e}")
+        import traceback
+        traceback.print_exc()
