@@ -269,8 +269,8 @@ class LocalViewer(Mini3DViewer):
                             # 如果成功，设置播放控制
                             if dpg.does_item_exist("_input_cycles"):
                                 dpg.set_value("_input_cycles", 1)
-                            if dpg.does_item_exist("_slider_record_timestep"):
-                                dpg.set_value("_slider_record_timestep", 0)
+                            if dpg.does_item_exist("_slider_timestep"):
+                                dpg.set_value("_slider_timestep", 0)
                             
                         except Exception as e:
                             print(f"自动模式：无法从API获取FLAME参数，将使用默认关键帧设置")
@@ -302,14 +302,51 @@ class LocalViewer(Mini3DViewer):
         if self.cfg.audio_path is not None and self.cfg.audio_path.exists():
             try:
                 print(f"Loading audio file: {self.cfg.audio_path}")
-                self.audio_data, original_sr = sf.read(self.cfg.audio_path)
                 
                 # 固定采样率为16000Hz
                 self.sample_rate = 16000
+                
+                # 检查是否需要重采样
+                audio_data, original_sr = sf.read(self.cfg.audio_path)
+                
                 if original_sr != self.sample_rate:
                     print(f"Resampling audio from {original_sr}Hz to {self.sample_rate}Hz")
-                    num_samples = int(len(self.audio_data) * self.sample_rate / original_sr)
-                    self.audio_data = signal_scipy.resample(self.audio_data, num_samples)
+                    # 使用FFmpeg进行重采样
+                    try:
+                        # 创建临时文件用于重采样输出
+                        temp_audio_path = str(self.cfg.temp_audio_path) + ".temp.wav"
+                        
+                        # 调用FFmpeg进行重采样到16000Hz，保持音频时长不变
+                        ffmpeg_cmd = [
+                            'ffmpeg', '-y',
+                            '-i', str(self.cfg.audio_path),
+                            '-ar', str(self.sample_rate),
+                            '-af', 'aresample=resampler=soxr',
+                            '-ac', '2',
+                            temp_audio_path
+                        ]
+                        
+                        print(f"执行FFmpeg重采样: {' '.join(ffmpeg_cmd)}")
+                        subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+                        
+                        # 加载重采样后的音频
+                        self.audio_data, actual_sr = sf.read(temp_audio_path)
+                        print(f"Audio resampled with FFmpeg: {self.audio_data.shape}, sr={actual_sr}Hz")
+                        
+                        # 清理临时文件
+                        try:
+                            os.remove(temp_audio_path)
+                        except:
+                            pass
+                    except Exception as e:
+                        print(f"FFmpeg重采样失败: {e}")
+                        print("回退到使用scipy进行重采样...")
+                        # 使用scipy进行重采样（备选方案）
+                        num_samples = int(len(audio_data) * self.sample_rate / original_sr)
+                        self.audio_data = signal_scipy.resample(audio_data, num_samples)
+                else:
+                    # 不需要重采样
+                    self.audio_data = audio_data
                 
                 # 如果是单声道，转换为立体声
                 if len(self.audio_data.shape) == 1:
@@ -319,6 +356,8 @@ class LocalViewer(Mini3DViewer):
                 self.current_sample = 0
             except Exception as e:
                 print(f"Error loading audio file: {e}")
+                import traceback
+                traceback.print_exc()
                 self.audio_data = None
                 self.sample_rate = None
         else:
@@ -658,7 +697,7 @@ class LocalViewer(Mini3DViewer):
             self.num_record_timeline = 0
             self.all_frames = {}
             # 确保时间线滑块被配置为有效范围（即使是0）
-            dpg.configure_item("_slider_record_timestep", min_value=0, max_value=0)
+            dpg.configure_item("_slider_timestep", min_value=0, max_value=0)
             return
         elif len(self.keyframes) == 1:
             # 只有一个关键帧时，使用其间隔作为时间线长度
@@ -672,7 +711,7 @@ class LocalViewer(Mini3DViewer):
 
         # 确保至少有1帧的时间线长度
         self.num_record_timeline = max(1, self.num_record_timeline)
-        dpg.configure_item("_slider_record_timestep", min_value=0, max_value=self.num_record_timeline-1)
+        dpg.configure_item("_slider_timestep", min_value=0, max_value=self.num_record_timeline-1)
 
         if len(self.keyframes) <= 0:
             self.all_frames = {}
@@ -727,7 +766,7 @@ class LocalViewer(Mini3DViewer):
             # 如果没有帧数据，返回当前状态
             return self.get_state_dict()
             
-        record_timestep = dpg.get_value("_slider_record_timestep")
+        record_timestep = dpg.get_value("_slider_timestep")
         # 确保record_timestep在有效范围内
         if self.num_record_timeline <= 0:
             return self.get_state_dict()
@@ -789,7 +828,7 @@ class LocalViewer(Mini3DViewer):
         
         for i in range(self.num_record_timeline):
             # update
-            dpg.set_value("_slider_record_timestep", i)
+            dpg.set_value("_slider_timestep", i)
             state_dict = self.get_state_dict_record()
             self.apply_state_dict(state_dict)
 
