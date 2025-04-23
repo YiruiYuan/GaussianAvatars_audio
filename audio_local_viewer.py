@@ -114,10 +114,50 @@ class LocalViewer(Mini3DViewer):
         # 设置中文字体支持
         dpg.create_context()
         if is_windows:
-            with dpg.font_registry():
-                with dpg.font("c:/windows/fonts/simhei.ttf", 18) as default_font:
-                    dpg.add_font_range_hint(dpg.mvFontRangeHint_Chinese_Full)
-                    dpg.bind_font(default_font)
+            # Windows特定字体设置
+            # 检查华文楷体字体是否存在，如果不存在则使用系统默认字体
+            font_path = "华文楷体.ttf"
+            if not os.path.exists(font_path):
+                # 尝试使用Windows常见中文字体
+                windows_fonts = [
+                    "C:/Windows/Fonts/simkai.ttf",  # 楷体
+                    "C:/Windows/Fonts/simhei.ttf",  # 黑体
+                    "C:/Windows/Fonts/simsun.ttc",  # 宋体
+                    "C:/Windows/Fonts/msyh.ttc"     # 微软雅黑
+                ]
+                for wfont in windows_fonts:
+                    if os.path.exists(wfont):
+                        font_path = wfont
+                        print(f"使用中文字体: {font_path}")
+                        break
+                else:
+                    print("未找到合适的中文字体，将使用默认字体")
+                    
+            try:
+                with dpg.font_registry():
+                    with dpg.font(font_path, 18) as default_font:
+                        dpg.add_font_range_hint(dpg.mvFontRangeHint_Chinese_Full)
+                        dpg.bind_font(default_font)
+            except Exception as e:
+                print(f"加载中文字体失败: {e}")
+        else:
+            # Linux字体支持
+            try:
+                linux_fonts = [
+                    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",  # 文泉驿微米黑
+                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",  # Noto Sans CJK
+                    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"  # Droid Sans
+                ]
+                for font_path in linux_fonts:
+                    if os.path.exists(font_path):
+                        print(f"使用Linux中文字体: {font_path}")
+                        with dpg.font_registry():
+                            with dpg.font(font_path, 18) as default_font:
+                                dpg.add_font_range_hint(dpg.mvFontRangeHint_Chinese_Full)
+                                dpg.bind_font(default_font)
+                        break
+            except Exception as e:
+                print(f"Linux加载中文字体失败: {e}")
         
         # recording settings
         self.keyframes = []  # list of state dicts of keyframes
@@ -132,7 +172,7 @@ class LocalViewer(Mini3DViewer):
         self.need_frame_update = False
         self.next_frame = 0
         self.should_skip_complex_frames = True  # 自动跳过复杂帧
-        self.max_render_time = 200.0  # 毫秒，大于这个值的帧会被标记为复杂帧
+        self.max_render_time = 100.0  # 毫秒，大于这个值的帧会被标记为复杂帧
         self.complex_frames = set()   # 记录复杂帧
         
         # 线程同步相关
@@ -1670,6 +1710,16 @@ class LocalViewer(Mini3DViewer):
         # Initialize audio status
         if self.audio_data is not None and self.sample_rate is not None:
             print(f"Audio loaded: {self.audio_data.shape}, sample rate: {self.sample_rate}Hz")
+            # 自动开始音频播放
+            if not self.audio_playing:
+                print("自动启动音频播放...")
+                self.playing = True
+                try:
+                    dpg.set_item_label("_button_play_pause", "Pause")
+                    dpg.set_value("_log_status", "Playing")
+                except Exception as e:
+                    print(f"更新UI状态失败: {e}")
+                self.start_audio()
         else:
             print("No audio loaded or invalid audio data")
             
