@@ -69,7 +69,7 @@ class Config(Mini3DViewerConfig):
     """default GUI background color"""
     save_folder: Path = Path("./viewer_output")
     """default saving folder"""
-    fps: int = 25
+    fps: int = 30
     """default fps for recording"""
     keyframe_interval: int = 1
     """default keyframe interval"""
@@ -79,7 +79,7 @@ class Config(Mini3DViewerConfig):
     load it like a normal sequence. """
     demo_mode: bool = False
     """The UI will be simplified in demo mode."""
-    lock_frame_rate: bool = True
+    lock_frame_rate: bool = False
     """Lock frame rate to match audio"""
     # audio_offset: float = 0.0
     # """Audio offset in seconds"""
@@ -1946,7 +1946,7 @@ class LocalViewer(Mini3DViewer):
             
             # 空闲时间
             idle_start = time.time()
-            time.sleep(0.005)  # 减轻CPU负担
+            #time.sleep(0.005)  # 减轻CPU负担
             idle_end = time.time()
             
             timing_stats["idle"] += (idle_end - idle_start)
