@@ -15,12 +15,12 @@ from PIL import Image
 from scipy.spatial.transform import Rotation as R
 import tyro
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QCheckBox, QFileDialog
 )
-from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 
 from utils.viewer_utils import Mini3DViewerConfig, Mini3DViewer, OrbitCamera
 from gaussian_renderer import GaussianModel, FlameGaussianModel, render
@@ -47,7 +47,7 @@ class Config(Mini3DViewerConfig):
 
 # -------------------- Rendering Thread --------------------
 class RenderThread(QThread):
-    image_ready = pyqtSignal(object)
+    image_ready = Signal(object)
 
     def __init__(self, viewer):
         super().__init__()
@@ -222,7 +222,7 @@ class LocalViewer(QMainWindow):
         self.btn_next = QPushButton("+")
         self.btn_next.clicked.connect(self.next_frame_slot)
         h2.addWidget(self.btn_next)
-        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider = QSlider(Qt.Horizontal)
         self.slider.setMinimum(0)
         self.slider.setMaximum(max(0, self.num_timesteps - 1))
         self.slider.valueChanged.connect(self.slider_changed)
@@ -241,7 +241,7 @@ class LocalViewer(QMainWindow):
 
         # Scale slider
         layout.addWidget(QLabel("Scale modifier"))
-        self.slider_scale = QSlider(Qt.Orientation.Horizontal)
+        self.slider_scale = QSlider(Qt.Horizontal)
         self.slider_scale.setMinimum(0)
         self.slider_scale.setMaximum(100)
         self.slider_scale.setValue(100)
