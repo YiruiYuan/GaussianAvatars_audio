@@ -54,7 +54,7 @@ class Config(Mini3DViewerConfig):
     """default GUI background color"""
     save_folder: Path = Path("./viewer_output")
     """default saving folder"""
-    fps: int = 25
+    fps: int = 30
     """default fps for playback"""
     demo_mode: bool = False
     """The UI will be simplified in demo mode."""

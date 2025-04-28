@@ -87,7 +87,7 @@ class Config(Mini3DViewerConfig):
     """API服务器URL"""
     tts_api_url: str = "http://10.112.208.173:5001"
     """TTS API服务器URL"""
-    use_pulseaudio: bool = True
+    use_pulseaudio: bool = False
     """使用PulseAudio播放音频"""
     pulseaudio_server: str = "100.127.107.62:4713"
     """PulseAudio服务器地址"""
