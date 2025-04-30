@@ -79,11 +79,11 @@ class Config(Mini3DViewerConfig):
     load it like a normal sequence. """
     demo_mode: bool = False
     """The UI will be simplified in demo mode."""
-    lock_frame_rate: bool = False
+    lock_frame_rate: bool = True
     """Lock frame rate to match audio"""
     # audio_offset: float = 0.0
     # """Audio offset in seconds"""
-    api_url: str = "http://localhost:5001"
+    api_url: str = "http://10.112.241.111:5001"
     """API服务器URL"""
     tts_api_url: str = "http://10.112.208.173:5001"
     """TTS API服务器URL"""
@@ -203,7 +203,8 @@ class LocalViewer(Mini3DViewer):
         
         # 设置PulseAudio环境
         self.pulse_sink_id = 0
-        self.setup_pulseaudio_env()
+        if self.cfg.use_pulseaudio:
+            self.setup_pulseaudio_env()
         
         # 加载音频文件
         if self.cfg.audio_path is not None:
@@ -512,8 +513,13 @@ class LocalViewer(Mini3DViewer):
                 # 创建音频流，尝试使用找到的第一个输出设备
                 device_to_use = None
                 if available_outputs:
-                    device_to_use = available_outputs[0]
-                    print(f"Using device {device_to_use} as audio output device")
+                    # 优先使用pulse设备（通常是设备0）
+                    if 0 in available_outputs:
+                        device_to_use = 0
+                        print(f"Using PulseAudio device (device 0) as audio output device")
+                    else:
+                        device_to_use = available_outputs[0]
+                        print(f"Using device {device_to_use} as audio output device")
                 else:
                     print("No available audio devices found, will try using system default...")
                 
@@ -535,27 +541,17 @@ class LocalViewer(Mini3DViewer):
                         while self.audio_playing and dpg.is_dearpygui_running():
                             sd.sleep(100)
                 except Exception as e:
-                    print(f"Failed to create audio stream: {e}")
-                    # 尝试使用PulseAudio的远程服务器
+                    print(f"Failed to create audio stream with specific device: {e}")
+                    print("Trying to use 'default' device...")
                     try:
-                        print("Trying to use PulseAudio remote server...")
-                        # 尝试使用PulseAudio waveout设备
-                        import os
-                        # 设置PULSE_SERVER环境变量
-                        pulse_server = os.environ.get("PULSE_SERVER", "100.127.107.62:4713")
-                        print(f"Using PulseAudio server: {pulse_server}")
-                        
-                        pulse_device = self.pulse_sink_id  # 使用之前找到的waveout设备ID
-                        print(f"Trying to use PulseAudio device ID: {pulse_device}")
-                        
                         with sd.OutputStream(
                             samplerate=self.sample_rate,
                             channels=self.audio_data.shape[1],
                             callback=self.audio_callback,
                             blocksize=1024,
-                            device=pulse_device
+                            device="default"
                         ) as stream:
-                            print(f"Successfully created audio stream using PulseAudio device")
+                            print(f"Audio stream created successfully using 'default' device")
                             self.audio_stream = stream
                             self.audio_playing = True
                             
@@ -563,62 +559,45 @@ class LocalViewer(Mini3DViewer):
                             while self.audio_playing and dpg.is_dearpygui_running():
                                 sd.sleep(100)
                     except Exception as e2:
-                        print(f"Failed to use PulseAudio device: {e2}")
+                        print(f"Failed to create audio stream with 'default' device: {e2}")
+                        
+                        # 直接跳转到虚拟音频模式
                         try:
-                            print("Trying to use default PulseAudio device...")
-                            pulse_device = "default"
-                            with sd.OutputStream(
-                                samplerate=self.sample_rate,
-                                channels=self.audio_data.shape[1],
-                                callback=self.audio_callback,
-                                blocksize=1024,
-                                device=pulse_device
-                            ) as stream:
-                                print(f"Successfully created audio stream using default PulseAudio device")
-                                self.audio_stream = stream
-                                self.audio_playing = True
-                                
-                                # 等待直到音频播放停止
-                                while self.audio_playing and dpg.is_dearpygui_running():
-                                    sd.sleep(100)
-                        except Exception as e3:
-                            print(f"Failed to use default PulseAudio device: {e3}")
-                            try:
-                                print("Trying to use virtual audio output...")
-                                # 如果所有输出设备尝试失败，回落到虚拟模式
-                                temp_buffer = np.zeros((1000, self.audio_data.shape[1]), dtype=self.audio_data.dtype)
-                                self.audio_stream = None  # 不使用实际流
-                                self.audio_playing = True
-                                
-                                # 模拟音频播放线程
-                                while self.audio_playing and dpg.is_dearpygui_running():
-                                    # 更新时间步位置
-                                    if self.playing:
-                                        next_frame = min(self.timestep + 1, self.num_timesteps - 1)
-                                        
-                                        # 检查是否需要循环
-                                        if next_frame == self.num_timesteps - 1 and dpg.get_value("_checkbox_loop"):
-                                            next_frame = 0
-                                        
-                                        # 设置下一帧
-                                        if self.timestep != next_frame:
-                                            self.next_frame = next_frame
-                                            self.need_frame_update = True
-                                            self.need_update = True
-                                            
-                                            # 更新音频位置
-                                            self.current_sample = int(next_frame / self.cfg.fps * self.sample_rate)
+                            print("Trying to use virtual audio output...")
+                            # 如果所有输出设备尝试失败，回落到虚拟模式
+                            temp_buffer = np.zeros((1000, self.audio_data.shape[1]), dtype=self.audio_data.dtype)
+                            self.audio_stream = None  # 不使用实际流
+                            self.audio_playing = True
+                            
+                            # 模拟音频播放线程
+                            while self.audio_playing and dpg.is_dearpygui_running():
+                                # 更新时间步位置
+                                if self.playing:
+                                    next_frame = min(self.timestep + 1, self.num_timesteps - 1)
                                     
-                                    # 模拟适当的播放速度
-                                    sd.sleep(int(1000 / self.cfg.fps))
-                            except Exception as e4:
-                                print(f"All audio output methods failed: {e4}")
-                                import traceback
-                                traceback.print_exc()
-            except Exception as e:
-                print(f"Failed to start audio playback: {e}")
-                import traceback
-                traceback.print_exc()
+                                    # 检查是否需要循环
+                                    if next_frame == self.num_timesteps - 1 and dpg.get_value("_checkbox_loop"):
+                                        next_frame = 0
+                                    
+                                    # 设置下一帧
+                                    if self.timestep != next_frame:
+                                        self.next_frame = next_frame
+                                        self.need_frame_update = True
+                                        self.need_update = True
+                                        
+                                        # 更新音频位置
+                                        self.current_sample = int(next_frame / self.cfg.fps * self.sample_rate)
+                                
+                                # 模拟适当的播放速度
+                                sd.sleep(int(1000 / self.cfg.fps))
+                        except Exception as e4:
+                            print(f"All audio output methods failed: {e4}")
+                            import traceback
+                            traceback.print_exc()
+                except Exception as e:
+                    print(f"Failed to start audio playback: {e}")
+                    import traceback
+                    traceback.print_exc()
             finally:
                 print("Audio playback thread ended")
                 self.audio_playing = False
@@ -1267,7 +1246,18 @@ class LocalViewer(Mini3DViewer):
                             self.last_frame_time = time.time()
                             # 如果有音频，开始播放
                             if self.audio_data is not None and not self.audio_playing:
-                                self.start_audio()
+                                # 首先尝试使用系统命令播放
+                                audio_path = str(self.cfg.audio_path.absolute())
+                                system_play_success = self.play_audio_with_system(audio_path)
+                                
+                                # 如果系统命令播放失败且启用PulseAudio，尝试使用PulseAudio
+                                if not system_play_success and self.cfg.use_pulseaudio:
+                                    print("系统命令播放失败，尝试使用PulseAudio...")
+                                    self.play_audio_with_pulseaudio(audio_path)
+                                # 如果系统命令播放失败且未启用PulseAudio，使用内置方法
+                                elif not system_play_success:
+                                    print("系统命令播放失败，使用内置方法...")
+                                    self.start_audio()
                         else:
                             dpg.set_item_label("_button_play_pause", "Play")
                             dpg.set_value("_log_status", "Paused")
@@ -1368,7 +1358,19 @@ class LocalViewer(Mini3DViewer):
                             # 启动音频播放
                             self.playing = True
                             dpg.set_item_label("_button_play_pause", "Pause")
-                            self.start_audio()
+                            
+                            # 首先尝试使用系统命令播放
+                            audio_path = str(self.cfg.audio_path.absolute())
+                            system_play_success = self.play_audio_with_system(audio_path)
+                            
+                            # 如果系统命令播放失败且启用PulseAudio，尝试使用PulseAudio
+                            if not system_play_success and self.cfg.use_pulseaudio:
+                                print("系统命令播放失败，尝试使用PulseAudio...")
+                                self.play_audio_with_pulseaudio(audio_path)
+                            # 如果系统命令播放失败且未启用PulseAudio，使用内置方法
+                            elif not system_play_success:
+                                print("系统命令播放失败，使用内置方法...")
+                                self.start_audio()
                     
                     dpg.add_button(label="Generate Animation from Audio", callback=callback_get_flame_from_api)
 
@@ -2172,19 +2174,26 @@ class LocalViewer(Mini3DViewer):
                 dpg.set_value("_log_status", "获取FLAME参数失败")
                 return False
                 
-            # 第四步：使用PulseAudio播放音频（如果启用）
-            if self.cfg.use_pulseaudio:
-                print("步骤4: 使用PulseAudio播放音频...")
-                self.play_audio_with_pulseaudio(audio_path)
+            # 第四步：播放音频
+            print("步骤4: 播放音频...")
+            audio_path = str(self.cfg.audio_path.absolute())
             
-            # 重置到起点并开始播放
+            # 首先尝试使用系统命令播放
+            system_play_success = self.play_audio_with_system(audio_path)
+            
+            # 如果系统命令播放失败并且启用了PulseAudio，尝试使用PulseAudio
+            if not system_play_success and self.cfg.use_pulseaudio:
+                print("系统命令播放失败，尝试使用PulseAudio...")
+                self.play_audio_with_pulseaudio(audio_path)
+            # 如果系统命令播放失败且未启用PulseAudio，使用内置方法
+            elif not system_play_success:
+                print("系统命令播放失败，使用内置方法...")
+                self.start_audio()
+            
+            # 重置到起点并开始播放动画
             dpg.set_value("_slider_timestep", 0)
             self.playing = True
             dpg.set_item_label("_button_play_pause", "Pause")
-            
-            if not self.cfg.use_pulseaudio:
-                # 使用内置方法播放音频
-                self.start_audio()
             
             dpg.set_value("_log_status", "处理完成，开始播放")
             return True
@@ -2194,6 +2203,82 @@ class LocalViewer(Mini3DViewer):
             import traceback
             traceback.print_exc()
             dpg.set_value("_log_status", f"处理错误: {str(e)[:30]}...")
+            return False
+
+    def play_audio_with_system(self, audio_path):
+        """使用系统命令播放音频
+        
+        Args:
+            audio_path (str): 音频文件路径
+            
+        Returns:
+            bool: 是否成功启动播放
+        """
+        try:
+            import subprocess
+            import os
+            
+            audio_path = str(audio_path)
+            print(f"使用系统命令播放音频: {audio_path}")
+            
+            # 尝试不同的播放命令
+            commands = []
+            
+            # 在Linux系统上
+            if os.name == 'posix':
+                # 首先尝试aplay
+                commands.append(["aplay", audio_path])
+                # 然后尝试ffplay
+                commands.append(["ffplay", "-nodisp", "-autoexit", audio_path])
+                # 尝试mpv
+                commands.append(["mpv", "--no-video", audio_path])
+            # 在Windows系统上
+            elif os.name == 'nt':
+                commands.append(["powershell", "-c", f"(New-Object Media.SoundPlayer '{audio_path}').PlaySync()"])
+            
+            # 尝试每一个命令
+            for cmd in commands:
+                try:
+                    print(f"尝试使用命令: {' '.join(cmd)}")
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+                    
+                    # 设置超时检查进程是否启动成功
+                    time.sleep(0.5)
+                    if process.poll() is None:  # 进程仍在运行
+                        print(f"成功启动播放进程")
+                        
+                        # 监控进程的线程
+                        def monitor_process():
+                            stdout, stderr = process.communicate()
+                            if process.returncode != 0:
+                                print(f"播放命令错误: {stderr.decode('utf-8', errors='ignore')}")
+                            else:
+                                print("音频播放完成")
+                                
+                        monitor_thread = threading.Thread(target=monitor_process)
+                        monitor_thread.daemon = True
+                        monitor_thread.start()
+                        
+                        return True
+                    else:
+                        # 进程已退出
+                        stderr = process.stderr.read().decode('utf-8', errors='ignore')
+                        print(f"播放命令执行失败: {stderr}")
+                except Exception as e:
+                    print(f"执行命令时出错: {e}")
+                    continue
+                    
+            print("所有播放命令都失败了")
+            return False
+            
+        except Exception as e:
+            print(f"使用系统命令播放音频时出错: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
 
@@ -2302,6 +2387,12 @@ API设置:
         if cfg.use_pulseaudio:
             os.environ["PULSE_SERVER"] = cfg.pulseaudio_server
             print(f"已设置PULSE_SERVER环境变量为: {cfg.pulseaudio_server}")
+        else:
+            # 如果不使用PulseAudio，确保环境变量被清除
+            if "PULSE_SERVER" in os.environ:
+                del os.environ["PULSE_SERVER"]
+                print("已清除PULSE_SERVER环境变量")
+            print("已禁用PulseAudio，将使用本地音频设备")
         
         # 测试API连接
         if cfg.test_api:
