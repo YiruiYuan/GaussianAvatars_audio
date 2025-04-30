@@ -241,6 +241,14 @@ class LocalViewer(Mini3DViewer):
         # 设置Ctrl+C处理
         signal.signal(signal.SIGINT, self.signal_handler)
         
+        # 打印同步模式信息
+        sync_mode = "音频驱动模式" if self.cfg.lock_frame_rate else "时间驱动模式"
+        print(f"当前同步模式: {sync_mode}")
+        if self.cfg.lock_frame_rate:
+            print("  - 视频帧将跟随音频位置，确保音视频同步")
+        else:
+            print("  - 音频将跟随视频帧位置，基于定时器控制")
+        
         # 如果处于自动模式且加载了音频，自动设置关键帧
         if self.auto_mode and self.audio_data is not None and self.gaussians.binding is not None:
             # 延迟执行，确保GUI已经完全初始化
@@ -385,14 +393,24 @@ class LocalViewer(Mini3DViewer):
             sample_index = int(self.timestep / self.cfg.fps * self.sample_rate) if self.cfg.fps > 0 else 0
             sample_index = max(0, sample_index) # 确保索引不为负
             
-            # 调试信息
-            # print(f"Audio callback: frame={self.timestep}, sample={sample_index}, total={len(self.audio_data)}")
-            
-            # 更新当前样本索引（如果需要同步）
-            self.current_sample = sample_index
-            
-            # 计算结束索引
-            end_idx = sample_index + frames
+            # 当lock_frame_rate为False时，使用帧索引控制音频位置
+            # 当lock_frame_rate为True时，使用流式播放，音频自然流动，视频跟随音频
+            if not self.cfg.lock_frame_rate:
+                # 调试信息
+                # print(f"Audio callback: frame={self.timestep}, sample={sample_index}, total={len(self.audio_data)}")
+                
+                # 更新当前样本索引（如果需要同步）
+                self.current_sample = sample_index
+                
+                # 计算结束索引
+                end_idx = sample_index + frames
+            else:
+                # 在锁定帧率模式下，允许音频自然流动
+                # 计算结束索引
+                end_idx = self.current_sample + frames
+                
+                # 更新当前样本索引，用于渲染帧追踪
+                sample_index = self.current_sample
             
             # 检查是否已经播放到文件末尾
             if sample_index >= len(self.audio_data) or sample_index < 0:
@@ -406,6 +424,9 @@ class LocalViewer(Mini3DViewer):
                         self.next_frame = 0
                         self.need_frame_update = True
                         self.need_update = True
+                        # 在lock_frame_rate模式下重置音频位置
+                        if self.cfg.lock_frame_rate:
+                            self.current_sample = 0
                         # 不直接调用UI更新
                         print("Audio position out of range, resetting to start")
                     else:
@@ -432,6 +453,9 @@ class LocalViewer(Mini3DViewer):
                         self.next_frame = 0
                         self.need_frame_update = True
                         self.need_update = True
+                        # 在lock_frame_rate模式下重置音频位置
+                        if self.cfg.lock_frame_rate:
+                            self.current_sample = 0
                         # 不直接调用UI更新
                         print("Audio playback ended, looping back to start")
                     else:
@@ -446,6 +470,9 @@ class LocalViewer(Mini3DViewer):
                 # 正常播放
                 try:
                     outdata[:] = self.audio_data[sample_index:end_idx]
+                    # 在lock_frame_rate模式下更新current_sample
+                    if self.cfg.lock_frame_rate:
+                        self.current_sample = end_idx  # 更新到下一个音频位置
                 except ValueError as e:
                     print(f"Audio buffer error: {e}, filling with zeros")
                     outdata.fill(0)
@@ -1290,7 +1317,11 @@ class LocalViewer(Mini3DViewer):
                     # 锁定帧率复选框
                     def callback_lock_frame_rate(sender, app_data):
                         self.cfg.lock_frame_rate = app_data
-                    dpg.add_checkbox(label="Lock Frame Rate", default_value=self.cfg.lock_frame_rate, 
+                        if app_data:
+                            dpg.set_value("_log_status", "音频驱动模式: 视频帧将跟随音频位置")
+                        else:
+                            dpg.set_value("_log_status", "时间驱动模式: 音频将跟随视频帧位置")
+                    dpg.add_checkbox(label="音频驱动视频 (Lock Frame Rate)", default_value=self.cfg.lock_frame_rate, 
                                     callback=callback_lock_frame_rate, tag="_checkbox_lock_frame_rate")
                 
                 # 速度控制
@@ -1873,12 +1904,38 @@ class LocalViewer(Mini3DViewer):
                 fps_target = self.cfg.fps * speed
                 time_since_last_frame = current_time - self.last_frame_time
                 
-                # 检查是否应该播放下一帧
-                if time_since_last_frame >= 1.0 / fps_target:
-                    self.last_frame_time = current_time
+                # 决定是否应该播放下一帧
+                should_advance_frame = False
+                
+                if self.cfg.lock_frame_rate and self.audio_playing and self.audio_data is not None:
+                    # 当启用帧率锁定时，根据音频位置来决定下一帧
+                    # 计算当前音频播放时间（秒）
+                    audio_time_seconds = self.current_sample / self.sample_rate if self.sample_rate else 0
+                    # 根据音频时间计算当前应该显示的帧
+                    target_frame = int(audio_time_seconds * self.cfg.fps)
                     
-                    # 计算下一帧
-                    next_frame = self.timestep + 1
+                    # 如果计算出的目标帧超过当前帧，需要更新
+                    if target_frame > self.timestep:
+                        should_advance_frame = True
+                        next_frame = target_frame  # 直接跳到音频对应的帧
+                        # 输出调试信息，帮助理解同步过程
+                        if target_frame - self.timestep > 1:
+                            print(f"音频同步: 跳帧 {self.timestep} -> {target_frame}")
+                    elif target_frame < self.timestep and target_frame > 0:
+                        # 音频落后于视频，可以考虑暂时暂停渲染直到音频赶上
+                        print(f"音频同步: 等待音频 (音频帧:{target_frame}, 视频帧:{self.timestep})")
+                        should_advance_frame = False
+                else:
+                    # 未启用帧率锁定，使用原有的基于时间的逻辑
+                    if time_since_last_frame >= 1.0 / fps_target:
+                        self.last_frame_time = current_time
+                        next_frame = self.timestep + 1
+                        should_advance_frame = True
+                
+                # 如果决定要前进到下一帧
+                if should_advance_frame:
+                    if not self.cfg.lock_frame_rate:
+                        self.last_frame_time = current_time  # 只在非锁定模式下更新帧时间
                     
                     # 如果启用跳帧，尝试找到下一个非复杂帧
                     if self.should_skip_complex_frames:
