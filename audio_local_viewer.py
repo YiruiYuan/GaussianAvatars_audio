@@ -1880,7 +1880,6 @@ class LocalViewer(Mini3DViewer):
             queue_end = time.time()
             timing_stats["queue_process"] += (queue_end - queue_start)
             timing_counts["queue_process"] += 1
-            
             # 更新音频相关UI
             audio_start = time.time()
             self.update_audio_display()
