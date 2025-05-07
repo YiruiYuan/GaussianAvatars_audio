@@ -105,6 +105,12 @@ class LocalViewer(Mini3DViewer):
         # 在super().__init__之前初始化show_debug_info
         self.show_debug_info = False  # 默认不显示调试信息
         
+        # 添加内容FPS追踪变量
+        self.last_content_update_time = time.time()
+        self.content_frames_rendered_count = 0
+        self.actual_content_fps = 0
+        self.last_timestep_displayed = -1  # 用于检测timestep是否真的改变了
+        
         # 创建必要的目录
         # 确保临时音频路径存在有效的父目录
         if str(self.cfg.temp_audio_path) == "" or os.path.dirname(str(self.cfg.temp_audio_path)) == "":
@@ -1220,6 +1226,9 @@ class LocalViewer(Mini3DViewer):
                 dpg.add_text("Render:")
                 dpg.add_text("0.0ms", tag="_log_render_time")
                 dpg.add_spacer(width=10)
+                dpg.add_text("Content FPS:")
+                dpg.add_text("0.00", tag="_log_actual_content_fps")
+                dpg.add_spacer(width=10)
                 dpg.add_text("Status:")
                 dpg.add_text("就绪", tag="_log_status")
             # 在这里添加你的复选框 (或者其他你认为合适的位置)
@@ -1760,6 +1769,17 @@ class LocalViewer(Mini3DViewer):
         # print(f"- Audio offset: {self.cfg.audio_offset}")
         print(f"- Auto mode: {self.auto_mode}")
         
+        # 初始化 last_timestep_displayed 为当前 timestep，避免第一次就错误计数
+        if hasattr(self, 'timestep'):
+            self.last_timestep_displayed = self.timestep
+        else:  # 以防万一 timestep 还未初始化
+            self.last_timestep_displayed = -1
+            
+        # 重置FPS追踪变量
+        self.last_content_update_time = time.time()
+        self.content_frames_rendered_count = 0
+        self.actual_content_fps = 0
+        
         if self.gaussians.binding is not None:
             print(f"FLAME model loaded:")
             print(f"- Total timesteps: {self.num_timesteps}")
@@ -1870,12 +1890,30 @@ class LocalViewer(Mini3DViewer):
                         self.render_buffer = render_buffer
                         self.render_time = render_time
                         
+                        # 检查是否有第三个元素作为timestep
+                        rendered_timestep = latest_render[2] if len(latest_render) >= 3 else self.timestep
+                        
+                        # 只有当显示的帧的timestep与上次不同时，才算作一次有效的内容更新
+                        if rendered_timestep != self.last_timestep_displayed:
+                            self.content_frames_rendered_count += 1
+                            self.last_timestep_displayed = rendered_timestep
+                        
                         # 更新UI - 保留纹理更新，这是必要的
                         dpg.set_value("_texture", self.render_buffer)
                         self.refresh_stat()
-                        self.ui_update_time = current_time
                 except Exception as e:
                     print(f"UI update error: {e}")
+            
+            # 定期计算和显示实际内容FPS
+            if current_time - self.last_content_update_time >= 1.0:  # 每秒更新一次
+                if current_time > self.last_content_update_time:  # 避免除以零
+                    self.actual_content_fps = self.content_frames_rendered_count / (current_time - self.last_content_update_time)
+                else:
+                    self.actual_content_fps = 0  # 或者保持上一个值
+                self.content_frames_rendered_count = 0
+                self.last_content_update_time = current_time
+                if dpg.does_item_exist("_log_actual_content_fps"):
+                    dpg.set_value("_log_actual_content_fps", f"{self.actual_content_fps:.2f}")
             
             queue_end = time.time()
             timing_stats["queue_process"] += (queue_end - queue_start)
@@ -1891,89 +1929,98 @@ class LocalViewer(Mini3DViewer):
             playback_start = time.time()
             if self.playing and not self.is_rendering and not self.need_frame_update and not self.need_update:
                 speed = getattr(self, 'playback_speed', 1.0)
-                fps_target = self.cfg.fps * speed
-                time_since_last_frame = current_time - self.last_frame_time
-                
-                # 决定是否应该播放下一帧
+                target_fps_for_content = self.cfg.fps * speed
+                time_per_content_frame = 1.0 / target_fps_for_content if target_fps_for_content > 0 else float('inf')
+
                 should_advance_frame = False
-                
-                if self.cfg.lock_frame_rate and self.audio_playing and self.audio_data is not None:
-                    # 计算当前音频播放时间（秒）
-                    audio_time_seconds = self.current_sample / self.sample_rate if self.sample_rate else 0
+                num_frames_to_advance_this_cycle = 0
+
+                if self.cfg.lock_frame_rate and self.audio_playing and self.audio_data is not None and self.sample_rate is not None:
+                    # 音频驱动模式
+                    audio_time_seconds = self.current_sample / self.sample_rate
+                    target_frame_from_audio = int(audio_time_seconds * self.cfg.fps)  # 注意这里用 self.cfg.fps, 不是 target_fps_for_content
                     
-                    # 根据音频时间计算当前应该显示的帧
-                    target_frame = int(audio_time_seconds * self.cfg.fps)
-                    
-                    # 计算需要前进的帧数
-                    delta_frames = target_frame - self.timestep
-                    
-                    # 如果需要前进帧，使用增量推进策略
+                    delta_frames = target_frame_from_audio - self.timestep
+
                     if delta_frames > 0:
-                        should_advance_frame = True
+                        # 缓解初始跳帧：如果差距过大，允许一次跳多几帧，但有上限
+                        if delta_frames > int(self.cfg.fps * 0.5):  # 例如，如果落后超过半秒的帧数
+                            # 初始追赶或大幅落后时，允许跳更多帧，但最多不超过一个较小的值
+                            num_frames_to_advance_this_cycle = min(delta_frames, 3)  # 简单点，最多跳3帧
+                        else:
+                            num_frames_to_advance_this_cycle = 1  # 正常情况下，一帧一帧追
                         
-                        # 限制每次最多前进1帧，确保UI能跟上
-                        next_frame = self.timestep + min(delta_frames, 1)
-                        
-                        # 如果差距过大，偶尔打印日志
-                        if delta_frames > 5 and target_frame % 10 == 0:
-                            print(f"音频进度超前: 目标帧={target_frame}, 当前帧={self.timestep}, 增量式推进中")
-                    elif delta_frames < 0 and target_frame > 0:
-                        # 音频落后于视频，可以考虑回退或暂停
-                        print(f"音频落后: 目标帧={target_frame}, 当前帧={self.timestep}")
-                        should_advance_frame = False
-                else:
-                    # 未启用帧率锁定，使用原有的基于时间的逻辑
-                    if time_since_last_frame >= 1.0 / fps_target:
-                        self.last_frame_time = current_time
-                        next_frame = self.timestep + 1
                         should_advance_frame = True
-                
-                # 如果决定要前进到下一帧
-                if should_advance_frame:
-                    if not self.cfg.lock_frame_rate:
-                        self.last_frame_time = current_time  # 只在非锁定模式下更新帧时间
+                        # 打印信息可以保留，但对于跳多帧的情况可能需要调整
+                        if delta_frames > 5 and target_frame_from_audio % 10 == 0:
+                             print(f"音频驱动: 目标帧={target_frame_from_audio}, 当前帧={self.timestep}, 计划前进={num_frames_to_advance_this_cycle}帧")
+
+                    elif delta_frames < 0:  # 音频落后视频
+                        # print(f"音频落后视频: 音频目标帧={target_frame_from_audio}, 视频当前帧={self.timestep}")
+                        should_advance_frame = False  # 视频等待音频
+
+                else:  # 时间驱动模式 (lock_frame_rate = False)
+                    time_since_last_advance = current_time - self.last_frame_time
                     
-                    # 如果启用跳帧，尝试找到下一个非复杂帧
-                    if self.should_skip_complex_frames:
-                        skip_count = 0
-                        max_skip_allowed = 3  # 限制最多连续跳过3帧
-                        
-                        while next_frame in self.complex_frames and skip_count < max_skip_allowed and next_frame < self.num_timesteps - 1:
-                            next_frame += 1
-                            skip_count += 1
-                        # 移除UI更新
-                        # if skip_count > 0:
-                        #     try:
-                        #         dpg.set_value("_log_status", f"Skipped {skip_count} slow frames")
-                        #     except:
-                        #         pass
+                    # 尝试更精确的节拍控制
+                    num_potential_advances = 0
+                    if time_per_content_frame > 0:  # 避免除以零
+                        num_potential_advances = math.floor(time_since_last_advance / time_per_content_frame)
+
+                    if num_potential_advances > 0:
+                        self.last_frame_time += num_potential_advances * time_per_content_frame
+                        num_frames_to_advance_this_cycle = num_potential_advances
+                        should_advance_frame = True
+                        # 限制单次主循环中时间驱动的最大前进帧数，避免累积过多一下子跳很多
+                        num_frames_to_advance_this_cycle = min(num_frames_to_advance_this_cycle, 3)  # 例如，最多前进3帧
+
+                if should_advance_frame and num_frames_to_advance_this_cycle > 0:
+                    next_target_timestep = self.timestep + num_frames_to_advance_this_cycle
                     
                     # 处理循环逻辑
-                    if next_frame >= self.num_timesteps:
+                    if next_target_timestep >= self.num_timesteps:
                         if dpg.get_value("_checkbox_loop"):
-                            next_frame = 0
+                            # 计算实际的下一帧（如果循环）
+                            # 如果 num_frames_to_advance_this_cycle 导致跳过结尾直接到开头某帧
+                            overshoot = next_target_timestep - self.num_timesteps
+                            next_frame_candidate = overshoot % self.num_timesteps  # 简单的循环
                         else:
                             self.playing = False
                             try:
                                 dpg.set_item_label("_button_play_pause", "Play")
                                 dpg.set_value("_log_status", "Playback complete")
-                                # 如果音频正在播放，停止音频
-                                if self.audio_playing:
+                                if self.audio_playing: 
                                     self.stop_audio()
-                            except:
-                                print("Warning: Failed to update playback controls")
-                            continue
-                    
-                    # 设置下一帧
-                    self.next_frame = next_frame
-                    try:
-                        dpg.set_value("_slider_timestep", self.next_frame)
-                        dpg.set_value("_log_current_frame", f"{self.next_frame}")
-                    except:
-                        print(f"Warning: Failed to update UI with frame {self.next_frame}")
-                    
-                    self.need_frame_update = True
-                    self.need_update = True
+                            except Exception as e: 
+                                print(f"UI Error: {e}")
+                            continue  # 结束本次播放逻辑
+                    else:
+                        next_frame_candidate = next_target_timestep
+
+                    if self.playing:  # 再次检查，因为上面可能停止了
+                        # 跳过复杂帧逻辑
+                        # 当前的跳帧逻辑是基于单帧前进的，如果一次前进多帧，需要调整
+                        # 暂时简化：如果目标是复杂帧，只前进一帧到非复杂帧（如果适用）
+                        final_next_frame = next_frame_candidate
+                        if self.should_skip_complex_frames and num_frames_to_advance_this_cycle == 1:  # 只在单帧推进时应用简单跳帧
+                            skip_count = 0
+                            max_skip_allowed = 3
+                            temp_next_frame = next_frame_candidate
+                            while temp_next_frame in self.complex_frames and skip_count < max_skip_allowed and temp_next_frame < self.num_timesteps - 1:
+                                temp_next_frame += 1
+                                skip_count += 1
+                            final_next_frame = temp_next_frame
+                        
+                        if self.timestep != final_next_frame:
+                            self.next_frame = final_next_frame
+                            try:
+                                dpg.set_value("_slider_timestep", self.next_frame)
+                                dpg.set_value("_log_current_frame", f"{self.next_frame}")
+                            except Exception as e: 
+                                print(f"UI Error: {e}")
+                            
+                            self.need_frame_update = True
+                            self.need_update = True
             
             playback_end = time.time()
             timing_stats["playback_logic"] += (playback_end - playback_start)
@@ -2029,6 +2076,7 @@ class LocalViewer(Mini3DViewer):
                 print(f"总帧时间:     {avg_stats['total_frame']:.2f} ms")
                 print(f"有效FPS:      {effective_fps:.2f}")
                 print(f"渲染线程FPS:  {1000 / (self.render_time*1000) if self.render_time else 0:.2f}")
+                print(f"实际内容FPS:  {self.actual_content_fps:.2f}")
                 
                 # 重置计数器
                 timing_stats = {k: 0.0 for k in timing_stats}
