@@ -102,6 +102,9 @@ class LocalViewer(Mini3DViewer):
     def __init__(self, cfg: Config):
         self.cfg = cfg
         
+        # 在super().__init__之前初始化show_debug_info
+        self.show_debug_info = False  # 默认不显示调试信息
+        
         # 创建必要的目录
         # 确保临时音频路径存在有效的父目录
         if str(self.cfg.temp_audio_path) == "" or os.path.dirname(str(self.cfg.temp_audio_path)) == "":
@@ -176,7 +179,8 @@ class LocalViewer(Mini3DViewer):
         self.complex_frames = set()   # 记录复杂帧
         
         # 线程同步相关
-        self.render_queue = queue.Queue(maxsize=1)
+        self.latest_frame_lock = threading.Lock()
+        self.latest_frame = None  # 用于存储(buffer, time, index)
         self.is_rendering = False
         self.render_start_time = 0     # 记录渲染开始时间
         self.thread_running = True
@@ -229,6 +233,7 @@ class LocalViewer(Mini3DViewer):
             print("Initializing FLAME parameters...")
             self.reset_flame_param()
         
+        # 调用父类的初始化方法
         super().__init__(cfg, 'GaussianAvatars - Audio Local Viewer')
 
         if self.gaussians.binding is not None:
@@ -305,6 +310,7 @@ class LocalViewer(Mini3DViewer):
             auto_thread = threading.Thread(target=auto_setup)
             auto_thread.daemon = True
             auto_thread.start()
+        
         
     def load_audio(self):
         """加载音频文件"""
@@ -1216,7 +1222,13 @@ class LocalViewer(Mini3DViewer):
                 dpg.add_spacer(width=10)
                 dpg.add_text("Status:")
                 dpg.add_text("就绪", tag="_log_status")
+            # 在这里添加你的复选框 (或者其他你认为合适的位置)
+            dpg.add_checkbox(label="显示性能信息",
+                             default_value=self.show_debug_info,
+                             callback=lambda sender, app_data, user_data: setattr(self, 'show_debug_info', app_data),
+                             tag="_checkbox_show_debug_info") # 给它一个标签
 
+            dpg.add_text(f"点数: {self.gaussians._xyz.shape[0]}")
             dpg.add_text(f"点数: {self.gaussians._xyz.shape[0]}")
             
             with dpg.group(horizontal=True):
@@ -1527,30 +1539,35 @@ class LocalViewer(Mini3DViewer):
             try:
                 # 处理帧更新请求
                 if self.need_frame_update and not self.is_rendering:
-                    dpg.set_value("_log_status", f"Updating frame to {self.next_frame}")
+                    # 移除UI更新
+                    # dpg.set_value("_log_status", f"Updating frame to {self.next_frame}")
                     try:
                         self.timestep = self.next_frame
                         # 添加防御性检查
                         if hasattr(self.gaussians, 'binding') and self.gaussians.binding is not None:
                             self.gaussians.select_mesh_by_timestep(self.timestep)
-                            dpg.set_value("_log_status", f"Updated to frame {self.timestep}")
-                        else:
-                            dpg.set_value("_log_status", f"Frame {self.timestep} (no FLAME model)")
+                            # 移除UI更新
+                            # dpg.set_value("_log_status", f"Updated to frame {self.timestep}")
+                        # else:
+                            # 移除UI更新
+                            # dpg.set_value("_log_status", f"Frame {self.timestep} (no FLAME model)")
                         
-                        dpg.set_value("_log_current_frame", f"{self.timestep}")
+                        dpg.set_value("_log_current_frame", f"{self.timestep}")  # 保留帧数显示，这是必要的
                         # 更新时间线显示
                         self.update_record_timeline()
                         self.need_frame_update = False
                     except Exception as e:
                         print(f"Error updating frame: {e}")
-                        dpg.set_value("_log_status", f"Error: {str(e)[:20]}...")
+                        # 移除UI更新
+                        # dpg.set_value("_log_status", f"Error: {str(e)[:20]}...")
                         self.need_frame_update = False  # 确保错误状态下也清除标志
                 
                 # 执行渲染
                 if self.need_update and not self.is_rendering:
                     # 检查是否是已知的复杂帧
                     if self.should_skip_complex_frames and self.playing and self.timestep in self.complex_frames:
-                        dpg.set_value("_log_status", f"Skipping slow frame {self.timestep}")
+                        # 移除UI更新
+                        # dpg.set_value("_log_status", f"Skipping slow frame {self.timestep}")
                         self.need_update = False
                         continue
                     
@@ -1558,10 +1575,11 @@ class LocalViewer(Mini3DViewer):
                     self.is_rendering = True
                     self.abort_render = False
                     
-                    try:
-                        dpg.set_value("_log_status", f"Rendering frame {self.timestep}...")
-                    except:
-                        print("Warning: Failed to update UI status")
+                    # 移除UI更新
+                    # try:
+                    #     dpg.set_value("_log_status", f"Rendering frame {self.timestep}...")
+                    # except:
+                    #     print("Warning: Failed to update UI status")
                     
                     # 记录渲染开始时间
                     self.render_start_time = time.time()
@@ -1584,11 +1602,13 @@ class LocalViewer(Mini3DViewer):
                         
                         # 渲染高斯点云
                         if show_splatting and not self.abort_render:
-                            dpg.set_value("_log_status", "Rendering gaussians...")
+                            # 移除UI更新
+                            # dpg.set_value("_log_status", "Rendering gaussians...")
                             
                             # 检查渲染是否超时
                             if time.time() - render_start_time > self.cfg.render_timeout:
-                                dpg.set_value("_log_status", f"Timeout rendering gaussians on frame {self.timestep}")
+                                # 移除UI更新
+                                # dpg.set_value("_log_status", f"Timeout rendering gaussians on frame {self.timestep}")
                                 timeout_occurred = True
                             else:
                                 rgb_splatting = render(cam, self.gaussians, self.cfg.pipeline, 
@@ -1597,11 +1617,13 @@ class LocalViewer(Mini3DViewer):
                         
                         # 渲染网格
                         if show_mesh and not self.abort_render and not timeout_occurred and self.gaussians.binding is not None:
-                            dpg.set_value("_log_status", "Rendering mesh...")
+                            # 移除UI更新
+                            # dpg.set_value("_log_status", "Rendering mesh...")
                             
                             # 检查渲染是否超时
                             if time.time() - render_start_time > self.cfg.render_timeout:
-                                dpg.set_value("_log_status", f"Timeout rendering mesh on frame {self.timestep}")
+                                # 移除UI更新
+                                # dpg.set_value("_log_status", f"Timeout rendering mesh on frame {self.timestep}")
                                 timeout_occurred = True
                             else:
                                 out_dict = self.mesh_renderer.render_from_camera(
@@ -1630,38 +1652,19 @@ class LocalViewer(Mini3DViewer):
                         # 标记复杂帧
                         if render_time * 1000 > self.max_render_time:
                             self.complex_frames.add(self.timestep)
-                            dpg.set_value("_log_status", f"Frame {self.timestep} is slow: {render_time*1000:.1f}ms")
+                            # 移除UI更新
+                            # dpg.set_value("_log_status", f"Frame {self.timestep} is slow: {render_time*1000:.1f}ms")
                         
                         # 避免在渲染线程中过多地更新UI状态
-                        status = ""
                         if not timeout_occurred and not self.abort_render:
                             render_buffer = rgb.cpu().numpy()
                             if render_buffer.shape[0] == self.H and render_buffer.shape[1] == self.W:
-                                try:
-                                    # 使用非阻塞方式放入队列
-                                    self.render_queue.put((render_buffer, render_time, self.timestep), 
-                                                        block=False)
-                                    status = "Render complete"
-                                except queue.Full:
-                                    status = "Render queue full, skipping update"
-                            else:
-                                status = f"Invalid render size: {render_buffer.shape}"
-                        elif timeout_occurred:
-                            status = f"Render timeout on frame {self.timestep}"
-                        else:
-                            status = f"Render aborted on frame {self.timestep}"
-                        
-                        try:
-                            dpg.set_value("_log_status", status)
-                        except:
-                            print(f"Warning: Failed to update UI status: {status}")
+                                # 使用锁保护写入最新帧
+                                with self.latest_frame_lock:
+                                    self.latest_frame = (render_buffer, render_time, self.timestep)
                         
                     except Exception as e:
                         print(f"Render task error: {traceback.format_exc()}")
-                        try:
-                            dpg.set_value("_log_status", f"Render error: {str(e)[:20]}...")
-                        except:
-                            print(f"Warning: Failed to update UI with error: {str(e)[:20]}")
                     
                     # 确保无论如何都重置状态
                     self.need_update = False
@@ -1669,14 +1672,10 @@ class LocalViewer(Mini3DViewer):
                     self.abort_render = False
                 else:
                     # 没有渲染任务，短暂休眠
-                    time.sleep(0.01)
+                    time.sleep(0.000001)
             
             except Exception as e:
                 print(f"Render thread error: {traceback.format_exc()}")
-                try:
-                    dpg.set_value("_log_status", f"Thread error: {str(e)[:20]}...")
-                except:
-                    print(f"Warning: Failed to update UI with thread error")
                 self.is_rendering = False
                 self.need_update = False
                 time.sleep(0.1)
@@ -1684,10 +1683,6 @@ class LocalViewer(Mini3DViewer):
             # 检查渲染是否运行超时
             if self.is_rendering and (time.time() - self.render_start_time > self.cfg.render_timeout + 1.0):
                 print(f"Render timeout detected for frame {self.timestep}")
-                try:
-                    dpg.set_value("_log_status", f"Timeout forced abort for frame {self.timestep}")
-                except:
-                    print("Warning: Failed to update UI status for timeout")
                 self.is_rendering = False
                 self.need_update = False
                 time.sleep(0.1)
@@ -1861,14 +1856,11 @@ class LocalViewer(Mini3DViewer):
             # 处理渲染队列
             queue_start = time.time()
             latest_render = None
-            try:
-                while True:
-                    render_data = self.render_queue.get(block=False)
-                    latest_render = render_data
-            except queue.Empty:
-                pass
-            except Exception as e:
-                print(f"Error clearing queue: {e}")
+            
+            # 读取最新帧
+            with self.latest_frame_lock:
+                if self.latest_frame is not None:
+                    latest_render = self.latest_frame
             
             # 更新渲染结果
             if latest_render is not None:
@@ -1878,9 +1870,8 @@ class LocalViewer(Mini3DViewer):
                         self.render_buffer = render_buffer
                         self.render_time = render_time
                         
-                        # 更新UI
+                        # 更新UI - 保留纹理更新，这是必要的
                         dpg.set_value("_texture", self.render_buffer)
-                        dpg.set_value("_log_render_time", f'{render_time*1000:.1f}ms')
                         self.refresh_stat()
                         self.ui_update_time = current_time
                 except Exception as e:
@@ -1908,22 +1899,28 @@ class LocalViewer(Mini3DViewer):
                 should_advance_frame = False
                 
                 if self.cfg.lock_frame_rate and self.audio_playing and self.audio_data is not None:
-                    # 当启用帧率锁定时，根据音频位置来决定下一帧
                     # 计算当前音频播放时间（秒）
                     audio_time_seconds = self.current_sample / self.sample_rate if self.sample_rate else 0
+                    
                     # 根据音频时间计算当前应该显示的帧
                     target_frame = int(audio_time_seconds * self.cfg.fps)
                     
-                    # 如果计算出的目标帧超过当前帧，需要更新
-                    if target_frame > self.timestep:
+                    # 计算需要前进的帧数
+                    delta_frames = target_frame - self.timestep
+                    
+                    # 如果需要前进帧，使用增量推进策略
+                    if delta_frames > 0:
                         should_advance_frame = True
-                        next_frame = target_frame  # 直接跳到音频对应的帧
-                        # 输出调试信息，帮助理解同步过程
-                        if target_frame - self.timestep > 1:
-                            print(f"音频同步: 跳帧 {self.timestep} -> {target_frame}")
-                    elif target_frame < self.timestep and target_frame > 0:
-                        # 音频落后于视频，可以考虑暂时暂停渲染直到音频赶上
-                        print(f"音频同步: 等待音频 (音频帧:{target_frame}, 视频帧:{self.timestep})")
+                        
+                        # 限制每次最多前进1帧，确保UI能跟上
+                        next_frame = self.timestep + min(delta_frames, 1)
+                        
+                        # 如果差距过大，偶尔打印日志
+                        if delta_frames > 5 and target_frame % 10 == 0:
+                            print(f"音频进度超前: 目标帧={target_frame}, 当前帧={self.timestep}, 增量式推进中")
+                    elif delta_frames < 0 and target_frame > 0:
+                        # 音频落后于视频，可以考虑回退或暂停
+                        print(f"音频落后: 目标帧={target_frame}, 当前帧={self.timestep}")
                         should_advance_frame = False
                 else:
                     # 未启用帧率锁定，使用原有的基于时间的逻辑
@@ -1940,14 +1937,17 @@ class LocalViewer(Mini3DViewer):
                     # 如果启用跳帧，尝试找到下一个非复杂帧
                     if self.should_skip_complex_frames:
                         skip_count = 0
-                        while next_frame in self.complex_frames and skip_count < 10 and next_frame < self.num_timesteps - 1:
+                        max_skip_allowed = 3  # 限制最多连续跳过3帧
+                        
+                        while next_frame in self.complex_frames and skip_count < max_skip_allowed and next_frame < self.num_timesteps - 1:
                             next_frame += 1
                             skip_count += 1
-                        if skip_count > 0:
-                            try:
-                                dpg.set_value("_log_status", f"Skipped {skip_count} slow frames")
-                            except:
-                                pass
+                        # 移除UI更新
+                        # if skip_count > 0:
+                        #     try:
+                        #         dpg.set_value("_log_status", f"Skipped {skip_count} slow frames")
+                        #     except:
+                        #         pass
                     
                     # 处理循环逻辑
                     if next_frame >= self.num_timesteps:
@@ -2045,6 +2045,11 @@ class LocalViewer(Mini3DViewer):
             self.render_thread.join(timeout=timeout)
             if self.render_thread.is_alive():
                 print("警告: 渲染线程未正常终止")
+
+        # 在run函数中条件性更新
+        if self.show_debug_info:
+            dpg.set_value("_log_render_time", f'{render_time*1000:.1f}ms')
+            # 其他调试信息...
 
     def setup_pulseaudio_env(self):
         """设置PulseAudio环境变量"""
