@@ -85,7 +85,7 @@ class Config(Mini3DViewerConfig):
     # """Audio offset in seconds"""
     api_url: str = "http://10.112.241.111:5001"
     """API服务器URL"""
-    tts_api_url: str = "http://10.112.208.173:5001"
+    tts_api_url: str = "http://100.123.215.34:5001"
     """TTS API服务器URL"""
     use_pulseaudio: bool = False
     """使用PulseAudio播放音频"""
@@ -329,6 +329,7 @@ class LocalViewer(Mini3DViewer):
                 
                 # 检查是否需要重采样
                 audio_data, original_sr = sf.read(self.cfg.audio_path)
+                print(f"初始读取的音频数据: shape={audio_data.shape}, 采样率={original_sr}Hz")
                 
                 if original_sr != self.sample_rate:
                     print(f"Resampling audio from {original_sr}Hz to {self.sample_rate}Hz")
@@ -365,25 +366,35 @@ class LocalViewer(Mini3DViewer):
                         # 使用scipy进行重采样（备选方案）
                         num_samples = int(len(audio_data) * self.sample_rate / original_sr)
                         self.audio_data = signal_scipy.resample(audio_data, num_samples)
+                        print(f"使用scipy重采样后: {self.audio_data.shape}")
                 else:
                     # 不需要重采样
                     self.audio_data = audio_data
+                    print(f"无需重采样，直接使用原始音频: {self.audio_data.shape}")
                 
                 # 如果是单声道，转换为立体声
                 if len(self.audio_data.shape) == 1:
+                    print(f"单声道音频转换为立体声前: {self.audio_data.shape}")
                     self.audio_data = np.stack([self.audio_data, self.audio_data], axis=1)
+                    print(f"单声道音频转换为立体声后: {self.audio_data.shape}")
                 
                 print(f"Audio loaded: {self.audio_data.shape}, sr={self.sample_rate}Hz")
                 self.current_sample = 0
+                return True  # 成功加载
             except Exception as e:
                 print(f"Error loading audio file: {e}")
                 import traceback
                 traceback.print_exc()
                 self.audio_data = None
                 self.sample_rate = None
+                return False  # 加载失败
         else:
-            print("No audio file specified or file does not exist.")
-            
+            if self.cfg.audio_path is None:
+                print("No audio file specified (self.cfg.audio_path is None)")
+            else:
+                print(f"Audio file does not exist: {self.cfg.audio_path}")
+            return False  # 加载失败
+    
     def audio_callback(self, outdata, frames, time, status):
         """音频回调函数，用于提供音频数据流"""
         if status:
@@ -506,6 +517,9 @@ class LocalViewer(Mini3DViewer):
         if self.audio_playing:
             print("Audio is already playing")
             return
+        
+        # 添加调试信息
+        print(f"开始播放音频，audio_data.shape={self.audio_data.shape}, sample_rate={self.sample_rate}")
             
         def audio_player():
             try:
@@ -521,6 +535,7 @@ class LocalViewer(Mini3DViewer):
                 # 初始化当前音频样本索引
                 self.current_sample = int(start_time * self.sample_rate)
                 print(f"Initialize audio sample index: {self.current_sample}")
+                print(f"音频总长度(样本数): {len(self.audio_data)}, 对应时长: {len(self.audio_data)/self.sample_rate:.2f}秒")
                 
                 # 使用 blocksize 参数控制音频缓冲区大小，可以提高同步精度
                 # 设置一个相对较小的缓冲区大小，以减少延迟
@@ -955,11 +970,15 @@ class LocalViewer(Mini3DViewer):
                 print(f"转换后的绝对路径: {abs_audio_path}")
                 audio_path = abs_audio_path
             
+            # 将本地路径转换为服务器路径
+            server_audio_path = self.convert_local_to_server_path(audio_path)
+            print(f"API请求将使用服务器路径: {server_audio_path}")
+            
             # 打印示例音频路径
             print("提示: 示例服务器音频路径格式: /home/plm/inferno/assets/data/EMOTE_test_example_data/02_that.wav")
             
             payload = {
-                "audio_path": audio_path,
+                "audio_path": server_audio_path,
                 "subject_style": subject_style,
                 "emotion": emotion,
                 "intensity": intensity
@@ -2217,15 +2236,22 @@ class LocalViewer(Mini3DViewer):
             audio_path = self.cfg.temp_audio_path
             print(f"保存TTS音频到: {audio_path}")
             
+            # 检查保存前的状态
+            print(f"保存前: self.cfg.audio_path = {self.cfg.audio_path}")
+            
             with open(audio_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
             
-            print(f"TTS音频保存成功: {audio_path}")
+            # 检查文件是否存在和大小
+            file_size = os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
+            print(f"TTS音频保存成功: {audio_path}, 文件大小: {file_size} 字节")
             
             # 更新当前音频路径
             self.cfg.audio_path = audio_path
+            print(f"TTS Success: self.cfg.audio_path更新为: {self.cfg.audio_path}")
+            print(f"更新后的文件存在: {os.path.exists(self.cfg.audio_path)}")
             
             # 加载音频
             self.load_audio()
@@ -2263,17 +2289,18 @@ class LocalViewer(Mini3DViewer):
             # 第二步：将音频文件路径保存到服务器
             print("步骤2: 准备音频文件路径...")
             audio_path = str(self.cfg.audio_path.absolute())
-            print(f"音频文件路径: {audio_path}")
+            print(f"本地音频文件路径: {audio_path}")
+            print(f"音频文件存在: {os.path.exists(audio_path)}")
+            if os.path.exists(audio_path):
+                print(f"音频文件大小: {os.path.getsize(audio_path)} 字节")
             
             # 第三步：从API获取FLAME参数
             print("步骤3: 获取FLAME参数...")
             dpg.set_value("_log_status", "正在获取FLAME参数...")
             
-            # 如果设置了server_audio_path，优先使用它
-            target_audio_path = self.cfg.server_audio_path if self.cfg.server_audio_path else audio_path
-            
+            # 直接使用本地音频路径，convert_local_to_server_path方法会在get_flame_params_from_api内部处理转换
             flame_success = self.get_flame_params_from_api(
-                target_audio_path,
+                audio_path,
                 subject_style="M003", 
                 emotion="neutral",
                 intensity=2
@@ -2287,6 +2314,12 @@ class LocalViewer(Mini3DViewer):
             print("步骤4: 播放音频...")
             audio_path = str(self.cfg.audio_path.absolute())
             
+            # 检查音频播放前的状态
+            print(f"播放音频前: self.cfg.audio_path = {self.cfg.audio_path}")
+            print(f"播放音频前: self.audio_data is None? {self.audio_data is None}")
+            if self.audio_data is not None:
+                print(f"播放音频前: self.audio_data.shape = {self.audio_data.shape}, self.sample_rate = {self.sample_rate}")
+            
             # 首先尝试使用系统命令播放
             system_play_success = self.play_audio_with_system(audio_path)
             
@@ -2297,6 +2330,15 @@ class LocalViewer(Mini3DViewer):
             # 如果系统命令播放失败且未启用PulseAudio，使用内置方法
             elif not system_play_success:
                 print("系统命令播放失败，使用内置方法...")
+                # 再次检查音频数据是否存在
+                if self.audio_data is None:
+                    print("警告: 尝试使用内置方法播放时，发现self.audio_data为None，尝试重新加载音频")
+                    load_success = self.load_audio()
+                    print(f"重新加载音频结果: {'成功' if load_success else '失败'}")
+                    if not load_success:
+                        print("重新加载音频失败，无法播放")
+                        return False
+                
                 self.start_audio()
             
             # 重置到起点并开始播放动画
@@ -2389,6 +2431,39 @@ class LocalViewer(Mini3DViewer):
             import traceback
             traceback.print_exc()
             return False
+
+    def convert_local_to_server_path(self, local_path):
+        """将本地路径转换为服务器路径
+        
+        本地的/home/plm/111路径需要映射到服务器的/home/plm路径
+        
+        Args:
+            local_path (str): 本地路径
+            
+        Returns:
+            str: 转换后的服务器路径
+        """
+        # 如果已经提供了服务器路径，直接返回
+        if self.cfg.server_audio_path:
+            return self.cfg.server_audio_path
+            
+        # 确保是字符串
+        local_path = str(local_path)
+        
+        # 检查是否是/home/plm/111开头的路径
+        if local_path.startswith('/home/plm/111/'):
+            # 将/home/plm/111/转换为/home/plm/
+            server_path = local_path.replace('/home/plm/111/', '/home/plm/', 1)
+            print(f"已将路径从 {local_path} 转换为 {server_path}")
+            return server_path
+        elif local_path.startswith('/home/plm/111'):
+            # 将/home/plm/111转换为/home/plm
+            server_path = local_path.replace('/home/plm/111', '/home/plm', 1)
+            print(f"已将路径从 {local_path} 转换为 {server_path}")
+            return server_path
+        else:
+            # 其他路径不变
+            return local_path
 
 
 if __name__ == "__main__":
